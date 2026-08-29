@@ -6,6 +6,8 @@ Boat chassis provides several advantages over other vehicle forms:
 - Simplified navigation - no terrain, no restricted flying zones
 - High payload capacity - marine has a comparable high capacity per size and power use which allows more versatility with electronics and components
 
+![](media/hull_cad.jpg)
+
 ## Design
 
 - Original design: https://www.printables.com/model/225276-rc-boat-134-parts-1907-tug-from-damen
