@@ -17,8 +17,8 @@ figure for power draw.
 
 | | |
 |---|---|
-| Throttle position | 40% |
-| Average speed | 0.6 m/s |
+| Throttle position | 50% |
+| Average speed (GPS) | ~1.0 m/s |
 | Run time | 15 min |
 
 ## Battery
@@ -35,4 +35,7 @@ figure for power draw.
 
 ## Power consumption
 
-*Calculated power consumption: TBD.*
+- Battery capacity: 7.4V * 800mAh / 1000 = 5.92 Wh
+- Battery remained: (7.7V - 7.1V) / (8.5V - 7.1V) = 43% (naively assumed linear discharge in 8.5~7.1 battery range)
+- Distance traveled: 15 * 60s * 1m/s = 0.9km
+- **Power consumption**:  5.92Wh * (1 - 0.43) / 0.9km = 3.75 Wh/km
