@@ -1,0 +1,62 @@
+{
+  "metadata": {
+    "log_started_at_wall_clock_time": "2026-09-11T21:50:24"
+  },
+  "exercises": [
+    {
+      "name": "dry land test",
+      "start": {
+        "log_time": "00:01:25",
+        "wall_clock_time": "2026-09-11T21:51:49"
+      },
+      "stop": {
+        "log_time": "00:04:00",
+        "wall_clock_time": "2026-09-11T21:54:24"
+      }
+    },
+    {
+      "name": "water float test 1",
+      "start": {
+        "log_time": "00:05:10",
+        "wall_clock_time": "2026-09-11T21:55:34"
+      },
+      "stop": {
+        "log_time": "00:05:55",
+        "wall_clock_time": "2026-09-11T21:56:19"
+      }
+    },
+    {
+      "name": "water float test 2",
+      "start": {
+        "log_time": "00:06:35",
+        "wall_clock_time": "2026-09-11T21:56:59"
+      },
+      "stop": {
+        "log_time": "00:08:35",
+        "wall_clock_time": "2026-09-11T21:58:59"
+      }
+    },
+    {
+      "name": "run test 1",
+      "start": {
+        "log_time": "00:09:23",
+        "wall_clock_time": "2026-09-11T21:59:47"
+      },
+      "stop": {
+        "log_time": "00:09:40",
+        "wall_clock_time": "2026-09-11T22:00:04"
+      }
+    },
+    {
+      "name": "run test 2",
+      "start": {
+        "log_time": "00:09:50",
+        "wall_clock_time": "2026-09-11T22:00:14"
+      },
+      "stop": {
+        "log_time": "00:10:09",
+        "wall_clock_time": "2026-09-11T22:00:33"
+      }
+    }
+  ]
+}
