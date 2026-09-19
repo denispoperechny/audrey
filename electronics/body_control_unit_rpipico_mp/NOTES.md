@@ -32,3 +32,15 @@ the REPL. Other bytes come back as text from `read_input()` (currently echoed as
 - Reading the port with repeated open/close shows a few stale lines on open and misses the
   rest. Keep a terminal open (`mpremote repl`) for a continuous view.
 - Don't use a second `UART(0, ...)` in the app; it made the interrupt unreliable.
+
+## Production mode (watchdog)
+`main.py` only starts the watchdog (2 s) when a file named `production` exists on the board.
+A running watchdog can't be stopped, so in production mode the board first holds neutral for
+3 s with the watchdog off, listening for Ctrl+C. To upload or change anything:
+
+    mpremote connect /dev/cu.usbserial-210 reset
+    mpremote connect /dev/cu.usbserial-210 fs rm :production      # run right after reset (within 3 s)
+
+Enable: `mpremote connect /dev/cu.usbserial-210 fs touch :production` and reset. A watchdog
+reset shows up as bit 7 (0x80) of the status flags. Without the flag (dev mode) there is no
+watchdog and uploads work as described above.

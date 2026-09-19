@@ -1,0 +1,8 @@
+- **GPIO 2** is PWM Write 1, on PWM Slice 1, Channel A. Pass: an independent Slice 1 output. Role: throttle servo/ESC output.
+- **GPIO 3** is PWM Read 1, on PWM Slice 1, Channel B. Pass: the Slice 1B input counter. Role: RC throttle input (measured with PIO).
+- **GPIO 4** is PWM Write 2, on PWM Slice 2, Channel A. Pass: an independent Slice 2 output. Role: rudder servo output.
+- **GPIO 5** is PWM Read 2, on PWM Slice 2, Channel B. Pass: the Slice 2B input counter. Role: RC rudder input (measured with PIO).
+- **GPIO 7** is PWM Read 3, on PWM Slice 3, Channel B. Pass: the Slice 3B input counter. Role: RC mode switch (below 1400 us = RC control, above 1600 us = ESP32 control).
+- **GPIO 14** is I2C SDA, on I2C1 (Function F3). Pass: native hardware mapping. Role: I2C target, address 0x31, register map in main.py.
+- **GPIO 15** is I2C SCL, on I2C1 (Function F3). Pass: native hardware mapping.
+- **GPIO 28** is ADC2 (analog input). Pass: battery probe, 2S pack via 10k/5k divider (Vbat = Vadc x 3).
