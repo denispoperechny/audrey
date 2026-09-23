@@ -26,7 +26,7 @@ figure for power draw.
 | | |
 |---|---|
 | Type | 2S, 800 mAh |
-| Voltage — initial | 8.5 V |
+| Voltage — initial | 8.4 V |
 | Voltage — final | 7.7 V |
 
 ## Observations
@@ -36,6 +36,6 @@ figure for power draw.
 ## Power consumption
 
 - Battery capacity: 7.4V * 800mAh / 1000 = 5.92 Wh
-- Battery remained: (7.7V - 7.1V) / (8.5V - 7.1V) = 43% (naively assumed linear discharge in 8.5~7.1 battery range)
+- Battery remained: (7.7V - 7.1V) / (8.4V - 7.1V) = 46% (naively assumed linear discharge in 8.4~7.1 battery range)
 - Distance traveled: 15 * 60s * 1m/s = 0.9km
-- **Power consumption**:  5.92Wh * (1 - 0.43) / 0.9km = 3.75 Wh/km
+- **Power consumption**:  5.92Wh * (1 - 0.46) / 0.9km = 3.55 Wh/km
