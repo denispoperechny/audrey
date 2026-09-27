@@ -1,0 +1,100 @@
+#include <Arduino.h>
+
+// --- DEBUG BUILD: raw UART passthrough --------------------------------
+// This sketch turns the ESP32 into a transparent bridge between the USB
+// serial monitor and the L76K GNSS module's UART: every byte typed in
+// the monitor goes straight to the module, and every byte the module
+// sends comes straight back to the monitor. No parsing, no PCAS commands
+// sent automatically — this lets you type raw commands at the module by
+// hand to debug the link itself. See GNSS_DEBUG.md for what to send and
+// what to expect. The previous NMEA-parsing application (fix parsing,
+// automatic PCAS config) is backed up at backups/main_nmea_client.cpp.bak
+// and can be restored once the module is confirmed working.
+//
+// Heltec WiFi LoRa 32 V4 (ESP32-S3) has two onboard LEDs:
+//  - GPIO35: plain white LED (digitalWrite) — this is the one this
+//    sketch blinks, as a simple "board hasn't crashed" heartbeat.
+//  - GPIO38: addressable WS2812 RGB LED (rgbLedWrite) — not used here
+//    (it also happens to double as the L76K GNSS RX line, see below).
+//
+// GNSS module: Quectel L76K, wired per src/gnss_info.txt (confirmed
+// against Heltec's own V4 datasheet/pinmap):
+//   GPIO34 - Ctrl_3v3 (power switch for the GNSS rail)
+//   GPIO39 - TX (module's TX -> ESP32 RX)
+//   GPIO38 - RX (module's RX -> ESP32 TX)
+//   GPIO40 - WAKE
+//   GPIO41 - PPS
+//   GPIO42 - RST
+
+#define LED_PIN 35
+
+#define GNSS_CTRL_PIN 34
+#define GNSS_RX_PIN 39  // ESP32 RX <- L76K TX
+#define GNSS_TX_PIN 38  // ESP32 TX -> L76K RX
+#define GNSS_WAKE_PIN 40
+#define GNSS_PPS_PIN 41
+#define GNSS_RESET_PIN 42
+
+#define GNSS_UART Serial1
+#define GNSS_BAUD 9600
+
+const unsigned long BLINK_INTERVAL_MS = 3000;
+
+static unsigned long lastBlinkTime = 0;
+static bool ledOn = false;
+
+// --- LED ---------------------------------------------------------------
+
+void updateBlink() {
+  unsigned long now = millis();
+  if (now - lastBlinkTime >= BLINK_INTERVAL_MS) {
+    lastBlinkTime = now;
+    ledOn = !ledOn;
+    digitalWrite(LED_PIN, ledOn ? HIGH : LOW);
+  }
+}
+
+// --- Setup / loop --------------------------------------------------------
+
+void setup() {
+  Serial.begin(115200);
+  // This board's USB is native CDC: a reset drops and re-enumerates the
+  // port, so a host-side monitor is briefly disconnected right when
+  // setup() runs. Give it up to 2s to reattach so nothing sent right at
+  // boot is lost into a CDC endpoint nobody's listening on yet. Bounded
+  // so boot still proceeds even with no monitor ever attached.
+  unsigned long serialWaitStart = millis();
+  while (!Serial && millis() - serialWaitStart < 2000) {
+    delay(10);
+  }
+
+  pinMode(LED_PIN, OUTPUT);
+
+  pinMode(GNSS_CTRL_PIN, OUTPUT);
+  digitalWrite(GNSS_CTRL_PIN, LOW);  // enable the GNSS 3V3 rail (active-low switch, same convention as Vext_Ctrl)
+
+  pinMode(GNSS_RESET_PIN, OUTPUT);
+  digitalWrite(GNSS_RESET_PIN, HIGH);  // release reset
+
+  pinMode(GNSS_WAKE_PIN, INPUT);
+  pinMode(GNSS_PPS_PIN, INPUT);
+
+  delay(100);  // let the GNSS module's power rail settle before talking to it
+  GNSS_UART.begin(GNSS_BAUD, SERIAL_8N1, GNSS_RX_PIN, GNSS_TX_PIN);
+
+  Serial.println("GNSS UART passthrough ready. Anything you type goes to the L76K; anything it sends comes back here.");
+}
+
+void loop() {
+  updateBlink();
+
+  // Monitor (computer) -> GNSS module
+  while (Serial.available()) {
+    GNSS_UART.write(Serial.read());
+  }
+
+  // GNSS module -> Monitor (computer)
+  while (GNSS_UART.available()) {
+    Serial.write(GNSS_UART.read());
+  }
+}

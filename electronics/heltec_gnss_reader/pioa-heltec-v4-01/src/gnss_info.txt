@@ -1,0 +1,11 @@
+
+module - l76k
+
+pinout (board - l76k):
+gpio34 - Ctrl_3v3
+gpio39 - tx
+gpio38 - rx
+gpio40 - wake
+gpio41 - pps
+gpio42 - rst
+

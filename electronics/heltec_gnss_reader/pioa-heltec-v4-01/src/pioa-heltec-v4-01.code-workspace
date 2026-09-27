@@ -1,0 +1,12 @@
+{
+	"folders": [
+		{
+			"path": "../../../../../../pioa-heltec-v4-01"
+		},
+		{
+			"name": "pioa-heltec-v4-01",
+			"path": ".."
+		}
+	],
+	"settings": {}
+}
