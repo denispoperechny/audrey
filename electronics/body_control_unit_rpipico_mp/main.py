@@ -63,7 +63,8 @@ MODE_LOW_US = 1400
 
 # ---- Timing ----
 LOOP_MS = 20  # 50 Hz
-FAILSAFE_MS = 200  # a source older than this is lost and its output goes neutral
+RC_FAILSAFE_MS = 200  # an RC pulse older than this is lost and its output goes neutral
+CMD_FAILSAFE_MS = 750  # same for the ESP32 command; longer, as its network stalls I2C sends
 REPORT_MS = 1000  # console print period
 WDT_MS = 2000
 
@@ -187,7 +188,7 @@ class PulseInput:
                 self.seen = True
 
     def fresh(self, now):
-        return self.seen and time.ticks_diff(now, self.stamp) <= FAILSAFE_MS
+        return self.seen and time.ticks_diff(now, self.stamp) <= RC_FAILSAFE_MS
 
     def value(self, now):
         return self.us if self.fresh(now) else None
@@ -220,7 +221,7 @@ class CommandLink:
         self.seen = True
 
     def fresh(self, now):
-        return self.seen and time.ticks_diff(now, self.stamp) <= FAILSAFE_MS
+        return self.seen and time.ticks_diff(now, self.stamp) <= CMD_FAILSAFE_MS
 
 
 class Battery:

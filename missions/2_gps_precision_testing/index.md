@@ -71,8 +71,6 @@ each run trimmed for possible GNSS lag):
 | run test 1 | 0.96 m/s | 5.8 m |
 | run test 2 | 1.07 m/s | 8.6 m |
 
-**~1 m/s confirmed** — Mission 1's 3.75 Wh/km estimate holds.
-
 Open question: the module's own speed-over-ground reads only ~1.5 kn
 (~0.77 m/s) during the runs — ~25% lower than the position-based figure. Not
 explained yet.

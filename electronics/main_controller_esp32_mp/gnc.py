@@ -41,7 +41,7 @@ Safety
   - If the GPS fix is lost or stale, command neutral from the ESP32 itself. The Pico's
     failsafe only notices missing I2C frames, and the ESP32 keeps re-sending the last command.
   - Keep in mind the ESP32 network thread can stall the I2C loop for 200+ ms (see the Pico's
-    FAILSAFE_MS); measure send gaps before relying on the 200 ms failsafe.
+    CMD_FAILSAFE_MS); measure send gaps before relying on the 750 ms failsafe.
 
 Implementation
   - Write the math (haversine or flat-earth distance, initial bearing, angle wrap, rudder
