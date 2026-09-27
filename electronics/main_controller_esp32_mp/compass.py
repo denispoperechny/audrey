@@ -42,6 +42,10 @@ AUTO_SAVE_AFTER_STABLE_MS = 5000
 
 ACCURACY_HIGH = 3
 
+# calibration_status sends a request to the sensor on every call; the accuracy barely
+# changes, so ask for it less often than the heading is read.
+ACCURACY_INTERVAL_MS = 1000
+
 
 class Compass:
     """Reads the fused heading and keeps the magnetometer calibration saved."""
@@ -58,11 +62,28 @@ class Compass:
         self.saved_now = False  # True only on the update() that saved the calibration
         self.high_accuracy_since = None
 
+        # The driver's euler property keeps returning the last reading even if the sensor
+        # stops sending, so freshness is judged by whether a new report object arrived:
+        # the driver stores every report as a new tuple in its _readings dict.
+        self.last_report = self.bno._readings.get(BNO_REPORT_ROTATION_VECTOR)
+        self.stamp = 0
+        self.seen = False
+        self.accuracy_stamp = None
+
     def update(self, now):
-        """Reads the latest heading and accuracy; saves the calibration once it's stable."""
+        """Reads the latest heading and accuracy; saves the calibration once it's stable.
+        I2C or driver errors propagate to the caller."""
         _roll, _tilt, pan = self.bno.euler  # (roll, tilt, pan); "pan" is yaw/heading, -180..180
-        self.heading = (HEADING_SIGN * pan + HEADING_OFFSET_DEG) % 360
-        self.accuracy = self.bno.calibration_status  # 0..3
+        report = self.bno._readings.get(BNO_REPORT_ROTATION_VECTOR)
+        if report is not self.last_report:
+            self.last_report = report
+            self.heading = (HEADING_SIGN * pan + HEADING_OFFSET_DEG) % 360
+            self.stamp = now
+            self.seen = True
+
+        if self.accuracy_stamp is None or time.ticks_diff(now, self.accuracy_stamp) >= ACCURACY_INTERVAL_MS:
+            self.accuracy = self.bno.calibration_status  # 0..3
+            self.accuracy_stamp = now
 
         self.saved_now = False
         if AUTO_SAVE_AFTER_STABLE_MS is None or self.calibration_saved:
@@ -75,6 +96,10 @@ class Compass:
             self.bno.calibration_save()
             self.calibration_saved = True
             self.saved_now = True
+
+    def fresh(self, now, max_age_ms):
+        """A new heading arrived within max_age_ms."""
+        return self.seen and time.ticks_diff(now, self.stamp) <= max_age_ms
 
     def describe(self):
         """One-line status for the console."""

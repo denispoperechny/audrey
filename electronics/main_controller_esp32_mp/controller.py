@@ -1,0 +1,452 @@
+"""Main vehicle controller (ESP32 WROOM, MicroPython). Started by main.py via run().
+
+One cooperative loop runs fixed-rate tasks; WiFi/MQTT run in their own threads (mqtt.py)
+so a network stall can't hold up the loop.
+
+  task        period   what
+  control       50 ms  decide throttle/rudder, send to the body control unit (bcu.py)
+  compass      100 ms  read heading (compass.py)
+  gps          500 ms  read the latest fix from the Heltec board (gps.py)
+  bcu_status  1000 ms  read the Pico's status block
+  mqtt        1000 ms  handle received commands, queue telemetry
+  report      1000 ms  console line, heartbeat LED, garbage collection
+
+The compass, the GPS board and the Pico share one I2C bus on GPIO21 (SDA) / GPIO22 (SCL):
+BNO08x at 0x4B, Heltec at 0x6D, Pico at 0x31.
+
+Resiliency -- this is an autonomous boat, so no single failure may stop the loop:
+  - Every task runs inside its own try/except. An exception is counted, logged (rate-
+    limited) and the loop moves on; the other tasks keep their schedule. Only Ctrl+C
+    (KeyboardInterrupt) gets through, so mpremote can still take over.
+  - A task that falls behind skips the missed runs instead of bursting to catch up.
+  - Nothing is used without being fresh: the heading has to be newer than
+    COMPASS_MAX_AGE_MS and the GPS fix has to be valid (gps.py), or control holds neutral.
+    The Pico independently goes neutral if our commands stop for 750 ms.
+  - A missing or dead compass is retried every COMPASS_RETRY_MS instead of failing boot.
+  - If I2C writes to the Pico keep failing, the bus is recovered (9 SCL pulses + STOP to
+    free a target stuck holding SDA, then the peripheral is re-created), at most every
+    I2C_RECOVERY_INTERVAL_MS, backing off to I2C_RECOVERY_MAX_INTERVAL_MS while it doesn't
+    help (e.g. the Pico is simply unplugged).
+  - Missing config.py or a failing network start only disables MQTT.
+  - Production mode (a file named "production" on the board) starts a hardware watchdog
+    that resets the chip if the loop stops for WDT_MS. It can't be stopped once running,
+    so the board first holds neutral for BOOT_WINDOW_MS, when Ctrl+C still gets through:
+    reset, then run mpremote within that window to upload or remove the flag.
+      Enable: mpremote fs touch :production     Disable: mpremote fs rm :production
+  - Anything that escapes all of the above (a bug in the loop itself) is caught in
+    main.py, which prints the error, commands neutral and resets the chip.
+
+Navigation isn't wired in yet (see gnc.py): control() always commands neutral, but the
+structure -- health checks first, then a decision with a reason -- is where it goes.
+"""
+
+import gc
+import json
+import os
+import time
+
+import esp32
+import machine
+from machine import I2C, Pin
+
+from bcu import BodyControlUnit
+from gps import GpsLink
+
+# compass (and its large bno08x driver) is imported only after WiFi has started; see
+# Controller.__init__.
+
+# ---- Pins ----
+I2C_SDA_PIN = 21
+I2C_SCL_PIN = 22
+I2C_FREQ = 100_000
+I2C_TIMEOUT_US = 200_000  # the Heltec board stretches SCL while it builds its packet
+LED_PIN = 2  # most ESP32 WROOM dev boards route the onboard LED to GPIO2
+
+# ---- Task periods ----
+CONTROL_PERIOD_MS = 50  # 20 Hz; the Pico treats a command older than 750 ms as lost
+COMPASS_PERIOD_MS = 100  # 10 Hz
+GPS_PERIOD_MS = 500  # 2 Hz; the GNSS module itself produces 1 fix/s
+BCU_STATUS_PERIOD_MS = 1000
+MQTT_PERIOD_MS = 1000
+REPORT_PERIOD_MS = 1000
+
+# ---- Health / recovery ----
+COMPASS_MAX_AGE_MS = 500  # a heading older than this isn't used for control
+COMPASS_LOST_MS = 3000  # no new heading for this long = re-initialize the sensor
+COMPASS_RETRY_MS = 10000  # at most this often (init blocks for ~1 s)
+GPS_LOST_MS = 1500  # Heltec board not answering for this long = no fix (3 missed polls)
+I2C_RECOVERY_AFTER_FAILS = 20  # consecutive failed writes to the Pico (1 s at 20 Hz)
+I2C_RECOVERY_INTERVAL_MS = 5000  # doubles after each recovery that didn't help...
+I2C_RECOVERY_MAX_INTERVAL_MS = 60000  # ...up to this; back to the start on a good write
+ERROR_LOG_INTERVAL_MS = 5000  # per task, print at most one error line this often
+
+# ---- Watchdog ----
+PRODUCTION_FLAG_FILE = "production"
+BOOT_WINDOW_MS = 3000
+WDT_MS = 8000  # longest intentional block is a compass init or calibration save, ~2 s
+
+RESET_CAUSES = {
+    machine.PWRON_RESET: "power-on",
+    machine.HARD_RESET: "hard",
+    machine.WDT_RESET: "watchdog",
+    machine.DEEPSLEEP_RESET: "deep sleep",
+    machine.SOFT_RESET: "soft",
+}
+
+
+def make_i2c():
+    return I2C(0, sda=Pin(I2C_SDA_PIN), scl=Pin(I2C_SCL_PIN), freq=I2C_FREQ, timeout=I2C_TIMEOUT_US)
+
+
+def unstick_i2c_bus():
+    """Frees a bus held by a target stuck mid-byte: clock SCL until it lets go of SDA,
+    then send a STOP. The hardware peripheral has to be re-created afterwards."""
+    scl = Pin(I2C_SCL_PIN, Pin.OPEN_DRAIN, value=1)
+    sda = Pin(I2C_SDA_PIN, Pin.OPEN_DRAIN, value=1)
+    for _ in range(9):
+        scl(0)
+        time.sleep_us(5)
+        scl(1)
+        time.sleep_us(5)
+    sda(0)
+    time.sleep_us(5)
+    scl(1)
+    time.sleep_us(5)
+    sda(1)
+    time.sleep_us(5)
+
+
+def memory_stats():
+    """MicroPython heap (it grows on demand by taking system RAM, and doesn't give it
+    back) and the remaining system RAM, which WiFi and the TLS handshake allocate from."""
+    heap_free = gc.mem_free()
+    idf = esp32.idf_heap_info(esp32.HEAP_DATA)
+    return {
+        "heap_total": heap_free + gc.mem_alloc(),
+        "heap_free": heap_free,
+        "sys_free": sum(region[1] for region in idf),
+        "sys_largest": max(region[2] for region in idf),
+    }
+
+
+def file_exists(name):
+    try:
+        os.stat(name)
+        return True
+    except OSError:
+        return False
+
+
+class Task:
+    """A fixed-rate job; exceptions are contained, counted and logged."""
+
+    def __init__(self, name, period_ms, fn):
+        self.name = name
+        self.period_ms = period_ms
+        self.fn = fn
+        self.due = time.ticks_ms()
+        self.runs = 0
+        self.skipped = 0  # runs dropped because the loop fell a whole period behind
+        self.errors = 0
+        self.last_error = ""
+        self.last_log = None
+        self.max_ms = 0  # longest run so far
+
+    def run_if_due(self):
+        now = time.ticks_ms()
+        if time.ticks_diff(now, self.due) < 0:
+            return
+        self.due = time.ticks_add(self.due, self.period_ms)
+        behind = time.ticks_diff(now, self.due)
+        if behind >= 0:
+            self.skipped += behind // self.period_ms + 1
+            self.due = time.ticks_add(now, self.period_ms)
+
+        try:
+            self.fn(now)
+        except Exception as e:  # KeyboardInterrupt is not an Exception, so Ctrl+C still works
+            self.errors += 1
+            self.last_error = "%s: %s" % (type(e).__name__, e)
+            if self.last_log is None or time.ticks_diff(now, self.last_log) >= ERROR_LOG_INTERVAL_MS:
+                self.last_log = now
+                print("task %s error #%d: %s" % (self.name, self.errors, self.last_error))
+        self.runs += 1
+        self.max_ms = max(self.max_ms, time.ticks_diff(time.ticks_ms(), now))
+
+    def ms_until_due(self, now):
+        return time.ticks_diff(self.due, now)
+
+    def stats(self):
+        return {"runs": self.runs, "errors": self.errors, "skipped": self.skipped,
+                "max_ms": self.max_ms, "last_error": self.last_error}
+
+
+class Controller:
+    def __init__(self):
+        self.boot_ms = time.ticks_ms()
+        self.reset_cause = RESET_CAUSES.get(machine.reset_cause(), str(machine.reset_cause()))
+        self.led = Pin(LED_PIN, Pin.OUT)
+
+        self.i2c = make_i2c()
+        self.bcu = BodyControlUnit(self.i2c)
+        self.bcu.send(0, 0)  # neutral as early as possible
+
+        # WiFi before anything memory-hungry: its driver allocates from the same RAM the
+        # MicroPython heap grows into, and compiling bno08x.py first left it with
+        # "WiFi Out of Memory".
+        gc.collect()
+        self.mqtt = self.start_mqtt()
+
+        self.gps = GpsLink(self.i2c, lost_ms=GPS_LOST_MS)
+        self.compass = None
+        self.compass_attempt = None
+        self.compass_inits = 0
+        self.try_init_compass(time.ticks_ms())
+
+        self.i2c_fail_streak = 0
+        self.i2c_recoveries = 0
+        self.last_i2c_recovery = None
+        self.i2c_recovery_interval = I2C_RECOVERY_INTERVAL_MS
+
+        # Latest control decision, for telemetry and the console.
+        self.throttle = 0
+        self.rudder = 0
+        self.reason = "boot"
+
+        self.last_command = None  # last parsed MQTT command (dict)
+        self.last_command_ms = None
+        self.bad_commands = 0
+
+        self.tasks = [
+            Task("control", CONTROL_PERIOD_MS, self.control),
+            Task("compass", COMPASS_PERIOD_MS, self.read_compass),
+            Task("gps", GPS_PERIOD_MS, self.read_gps),
+            Task("bcu_status", BCU_STATUS_PERIOD_MS, self.read_bcu_status),
+            Task("mqtt", MQTT_PERIOD_MS, self.exchange_mqtt),
+            Task("report", REPORT_PERIOD_MS, self.report),
+        ]
+
+    # ---- startup helpers ---------------------------------------------------------------
+
+    def start_mqtt(self):
+        try:
+            from config import config
+            from mqtt import MqttLink
+
+            link = MqttLink(config)
+            link.start()
+            return link
+        except Exception as e:
+            print("mqtt disabled: %s: %s" % (type(e).__name__, e))
+            return None
+
+    def try_init_compass(self, now):
+        """(Re)creates the compass. Blocks ~1 s when the sensor is there; fails fast when
+        it isn't. Failures are reported and retried later, never raised."""
+        self.compass_attempt = now
+        self.compass = None
+        try:
+            from compass import Compass
+
+            self.compass = Compass(self.i2c)
+            self.compass_inits += 1
+            print("compass ready (init #%d)" % self.compass_inits)
+        except Exception as e:
+            print("compass init failed: %s: %s" % (type(e).__name__, e))
+
+    # ---- tasks -----------------------------------------------------------------------
+
+    def control(self, now):
+        self.throttle, self.rudder, self.reason = self.decide(now)
+        if self.bcu.send(self.throttle, self.rudder):
+            self.i2c_fail_streak = 0
+            self.i2c_recovery_interval = I2C_RECOVERY_INTERVAL_MS
+        else:
+            self.i2c_fail_streak += 1
+            if self.i2c_fail_streak >= I2C_RECOVERY_AFTER_FAILS:
+                self.recover_i2c(now)
+
+    def decide(self, now):
+        """Returns (throttle %, rudder %, reason). Health checks first: anything we can't
+        trust means neutral."""
+        if not self.heading_ok(now):
+            return 0, 0, "hold: no heading"
+        if not self.gps.fix_valid(now):
+            return 0, 0, "hold: no gps fix"
+        # Navigation goes here (gnc.py) once it's wired in.
+        return 0, 0, "idle"
+
+    def read_compass(self, now):
+        if not self.compass_lost(now):
+            self.compass.update(now)  # errors are counted by the task; staleness decides re-init
+        elif time.ticks_diff(now, self.compass_attempt) >= COMPASS_RETRY_MS:
+            self.try_init_compass(now)
+
+    def read_gps(self, now):
+        self.gps.poll(now)
+
+    def read_bcu_status(self, now):
+        self.bcu.read_status()
+
+    def exchange_mqtt(self, now):
+        if self.mqtt is None:
+            return
+        while True:
+            item = self.mqtt.get_command()
+            if item is None:
+                break
+            self.handle_command(item[0], item[1])
+        self.mqtt.publish(self.telemetry(now))
+
+    def report(self, now):
+        self.led.value(not self.led.value())
+        gc.collect()  # at a known moment, instead of whenever an allocation triggers it
+        print(" | ".join((
+            "out thr=%d rud=%d (%s)" % (self.throttle, self.rudder, self.reason),
+            self.describe_compass(now),
+            self.gps.describe(now),
+            self.bcu.describe(),
+            self.mqtt.describe() if self.mqtt is not None else "mqtt: disabled",
+            self.task_errors_summary(),
+            self.describe_memory(),
+        )))
+
+    # ---- helpers ---------------------------------------------------------------------
+
+    def compass_lost(self, now):
+        """No sensor, or no new heading for COMPASS_LOST_MS (counting from the init if it
+        never sent one)."""
+        compass = self.compass
+        if compass is None:
+            return True
+        last = compass.stamp if compass.seen else self.compass_attempt
+        return time.ticks_diff(now, last) > COMPASS_LOST_MS
+
+    def describe_compass(self, now):
+        if self.compass is None:
+            return "compass: not available"
+        line = self.compass.describe()
+        return line if self.compass.fresh(now, COMPASS_MAX_AGE_MS) else line + " (STALE)"
+
+    def heading_ok(self, now):
+        return self.compass is not None and self.compass.fresh(now, COMPASS_MAX_AGE_MS)
+
+    def handle_command(self, payload, received_ms):
+        """Parses and records a command. Commands don't drive the outputs yet -- that's
+        a deliberate next step, not an accidental one."""
+        try:
+            command = json.loads(payload)
+            if not isinstance(command, dict):
+                raise ValueError("not a JSON object")
+        except ValueError as e:
+            self.bad_commands += 1
+            print("mqtt command rejected (%s): %r" % (e, payload))
+            return
+        self.last_command = command
+        self.last_command_ms = received_ms
+        print("mqtt command: %r" % (command,))
+
+    def recover_i2c(self, now):
+        if self.last_i2c_recovery is not None:
+            if time.ticks_diff(now, self.last_i2c_recovery) < self.i2c_recovery_interval:
+                return
+            # Still failing since the last recovery: it didn't help, so try less often.
+            self.i2c_recovery_interval = min(self.i2c_recovery_interval * 2, I2C_RECOVERY_MAX_INTERVAL_MS)
+        self.last_i2c_recovery = now
+        self.i2c_recoveries += 1
+        print("i2c: %d failed writes in a row, recovering bus (#%d, next in >= %d s)" % (
+            self.i2c_fail_streak, self.i2c_recoveries, self.i2c_recovery_interval // 1000))
+        unstick_i2c_bus()
+        self.i2c = make_i2c()
+        self.bcu.i2c = self.i2c
+        self.gps.i2c = self.i2c
+        if self.compass is not None:
+            self.compass.bno._i2c = self.i2c  # the driver keeps its own reference
+        self.i2c_fail_streak = 0
+
+    def describe_memory(self):
+        m = memory_stats()
+        return "mem: heap %d/%d KB free, sys %d KB free (largest %d KB)" % (
+            m["heap_free"] // 1024, m["heap_total"] // 1024, m["sys_free"] // 1024, m["sys_largest"] // 1024)
+
+    def task_errors_summary(self):
+        failing = ["%s=%d" % (t.name, t.errors) for t in self.tasks if t.errors]
+        return "task errors: " + (", ".join(failing) if failing else "none")
+
+    def telemetry(self, now):
+        gps = self.gps
+        compass = self.compass
+        return {
+            "uptime_s": time.ticks_diff(now, self.boot_ms) // 1000,
+            "reset_cause": self.reset_cause,
+            "memory": memory_stats(),
+            "output": {"throttle": self.throttle, "rudder": self.rudder, "reason": self.reason},
+            "compass": None if compass is None else {
+                "heading": compass.heading,
+                "accuracy": compass.accuracy,
+                "fresh": compass.fresh(now, COMPASS_MAX_AGE_MS),
+                "inits": self.compass_inits,
+            },
+            "gps": {
+                "answering": gps.answering(now),
+                "fix_valid": gps.fix_valid(now),
+                "fix_good": gps.fix_good(now),
+                "lat": gps.lat,
+                "lon": gps.lon,
+                "alt_m": gps.alt_m,
+                "sats": gps.sats,
+                "hdop": gps.hdop,
+                "sog_kn": gps.sog_kn,
+                "cog_deg": gps.cog_deg,
+                "age_ms": gps.age_ms,
+                "errors": {"i2c": gps.i2c_errors, "crc": gps.crc_errors, "version": gps.version_errors},
+            },
+            "bcu": self.bcu.status_dict(),
+            "bcu_errors": {
+                "write": self.bcu.write_errors,
+                "status_i2c": self.bcu.status_i2c_errors,
+                "status_checksum": self.bcu.status_checksum_errors,
+            },
+            "i2c_recoveries": self.i2c_recoveries,
+            "last_command": self.last_command,
+            "bad_commands": self.bad_commands,
+            "tasks": {t.name: t.stats() for t in self.tasks},
+        }
+
+    # ---- main loop -------------------------------------------------------------------
+
+    def hold_boot_window(self):
+        """Production mode only: hold neutral with no watchdog yet, so Ctrl+C can still
+        reach the REPL for uploads."""
+        print("production mode: %d ms boot window (Ctrl+C now to stop)" % BOOT_WINDOW_MS)
+        end = time.ticks_add(time.ticks_ms(), BOOT_WINDOW_MS)
+        while time.ticks_diff(end, time.ticks_ms()) > 0:
+            try:
+                self.bcu.send(0, 0)
+            except Exception:
+                pass
+            time.sleep_ms(CONTROL_PERIOD_MS)
+
+    def run(self):
+        wdt = None
+        if file_exists(PRODUCTION_FLAG_FILE):
+            self.hold_boot_window()
+            wdt = machine.WDT(timeout=WDT_MS)
+        print("controller running, reset cause: %s, watchdog: %s" % (
+            self.reset_cause, "on" if wdt else "off (dev mode)"))
+
+        tasks = self.tasks
+        while True:
+            for task in tasks:
+                task.run_if_due()
+            if wdt is not None:
+                wdt.feed()
+            now = time.ticks_ms()
+            wait = min(task.ms_until_due(now) for task in tasks)
+            if wait > 0:
+                time.sleep_ms(wait)  # also lets the WiFi/MQTT threads run
+
+
+
+def run():
+    Controller().run()
