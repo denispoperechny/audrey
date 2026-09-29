@@ -153,6 +153,22 @@ often as it likes while the L76K stays at the proven 9600 / 1Hz setup.
     controller has NTP); narrowed `seq`/`ageMs` to 16 bits and the
     recovery counters to 8 bits. A classic-ESP32 controller (WROOM) read
     v2 cleanly with 44-byte reads.
+- **Pre-loading the TX FIFO was tried and not kept (2026-09-29).** With v3
+  the packet fits the FIFO, so a build loaded it ahead of every read
+  (`slaveWrite` after a direct FIFO reset, only while the bus had been idle
+  continuously; the request callback wrote nothing). Debug counters showed
+  it worked — the FIFO held the packet at nearly every read — but reads
+  still failed about as often (~35–40% of raw reads with an ESP32-S3
+  controller at 50 kHz soft I2C), almost all as `db db db ...` repeated for
+  the whole read, a stuck target state seen with every firmware variant
+  (v2/v3, with and without pre-load) and independent of packet contents. So
+  pre-loading doesn't address it and was reverted for simplicity. Notes if
+  retrying: the core empties the TX FIFO after read transactions apparently
+  including ones for other addresses (refill after any bus activity), and
+  resetting the FIFO mid-transfer wedges the target (idle must be observed
+  continuously). Candidates to get rid of the stuck state: MicroPython's
+  `machine.I2CTarget` or ESP-IDF's own I2C target driver instead of the
+  Arduino core's, or not using this board as an I2C target at all.
 - **Controller requirements**: pull-ups (e.g. 4.7kΩ to 3.3V), shared GND,
   3.3V logic, and support for **clock stretching** — the ESP32-S3 holds
   SCL low while the request callback runs. The Raspberry Pi's hardware

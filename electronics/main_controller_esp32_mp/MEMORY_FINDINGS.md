@@ -2,6 +2,38 @@
 
 Status as of 2026-09-27. Picks up where the controller rebuild left off.
 
+## Update 2026-09-29 — moved to XIAO ESP32-S3 (branch feature/s3_adaptation)
+
+The memory problem is solved by hardware: a Seeed XIAO ESP32-S3 with 8 MB PSRAM
+(MicroPython 1.29 `ESP32_GENERIC_S3-SPIRAM_OCT`). MQTT over TLS runs with ~8 MB free.
+Everything below the next heading is the original WROOM investigation.
+
+State at the end of the day:
+- **XIAO:** runs the controller (board auto-detected in `controller.py`). I2C on D4/D5
+  as **software I2C at 50 kHz**: on the bench wiring, the S3's hardware I2C failed at
+  every speed with compass + Heltec on the bus. Console/uploads over UART via a CH340 on
+  D6/D7 (`./deploy.sh /dev/cu.usbserial-XXX`); MicroPython's UART REPL is on by default.
+- **Compass:** works alongside the Heltec at 50 kHz soft I2C; occasional stale seconds.
+- **GPS (Heltec):** packet v3 (30 bytes; read 31, accept offset 0/1), Heltec I2C moved
+  to GPIO3/4. The Heltec's ESP32-S3 I2C *target* (Arduino core) still fails ~35–40% of
+  raw reads (stuck `db db db` state); the controller polls at 5 Hz with a 2 s lost
+  window, which rides it out (fix valid every second in the last check). Details and
+  what was tried: `electronics/heltec_gnss_reader/pioa-heltec-v4-01/DECISIONS.md`.
+- **The Heltec currently runs an experimental pre-load firmware** (performs the same as
+  v3). Its source was reverted to the committed v3; reflash it in bootloader mode
+  (hold PRG, press RST, release PRG; `pio run -t upload`) to match the repo.
+- **Pico:** not connected during these tests.
+
+Next steps to consider:
+1. Get rid of the Heltec I2C target flakiness: MicroPython `machine.I2CTarget` on the
+   Heltec, or wire the L76K GPS directly to the XIAO's UART (UART1 on D0/D1), or to the
+   Pico (a proven I2C target).
+2. Fix the bus-recovery rule in `controller.py`: only real bus faults (timeouts / a line
+   held low) should trigger it, not a device that doesn't answer.
+3. Reconnect the Pico and test all three devices; then revisit hardware I2C with
+   shorter wires / 4.7 kΩ pull-ups.
+4. Commit this branch's changes.
+
 ## TL;DR
 
 The new controller runs on the ESP32 WROOM and survives failures, but **MQTT can't

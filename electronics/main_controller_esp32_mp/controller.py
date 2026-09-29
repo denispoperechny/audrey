@@ -9,7 +9,7 @@ so a network stall can't hold up the loop.
   task        period   what
   control       50 ms  decide throttle/rudder, send to the body control unit (bcu.py)
   compass      100 ms  read heading (compass.py)
-  gps          500 ms  read the latest fix from the Heltec board (gps.py)
+  gps          200 ms  read the latest fix from the Heltec board (gps.py)
   bcu_status  1000 ms  read the Pico's status block
   mqtt        1000 ms  handle received commands, queue telemetry
   report      1000 ms  console line, heartbeat LED, garbage collection
@@ -95,7 +95,8 @@ I2C_TIMEOUT_US = 200_000  # the Heltec board stretches SCL while it builds its p
 # ---- Task periods ----
 CONTROL_PERIOD_MS = 50  # 20 Hz; the Pico treats a command older than 750 ms as lost
 COMPASS_PERIOD_MS = 100  # 10 Hz
-GPS_PERIOD_MS = 500  # 2 Hz; the GNSS module itself produces 1 fix/s
+GPS_PERIOD_MS = 200  # 5 Hz, though the GNSS module produces 1 fix/s: the Heltec's I2C target
+# fails ~35-40% of reads with the XIAO (see its DECISIONS.md), so poll often and ride it out
 BCU_STATUS_PERIOD_MS = 1000
 MQTT_PERIOD_MS = 1000
 REPORT_PERIOD_MS = 1000
@@ -104,7 +105,7 @@ REPORT_PERIOD_MS = 1000
 COMPASS_MAX_AGE_MS = 500  # a heading older than this isn't used for control
 COMPASS_LOST_MS = 3000  # no new heading for this long = re-initialize the sensor
 COMPASS_RETRY_MS = 10000  # at most this often (init blocks for ~1 s)
-GPS_LOST_MS = 1500  # Heltec board not answering for this long = no fix (3 missed polls)
+GPS_LOST_MS = 2000  # Heltec board not answering for this long = no fix (10 missed polls)
 I2C_RECOVERY_AFTER_FAILS = 20  # consecutive failed writes to the Pico (1 s at 20 Hz)
 I2C_RECOVERY_INTERVAL_MS = 5000  # doubles after each recovery that didn't help...
 I2C_RECOVERY_MAX_INTERVAL_MS = 60000  # ...up to this; back to the start on a good write
