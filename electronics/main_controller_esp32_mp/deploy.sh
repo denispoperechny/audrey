@@ -1,17 +1,20 @@
 #!/bin/sh
 # Compiles the controller modules to .mpy and uploads them with main.py, then resets.
 #
-#   ./deploy.sh [port]      # port defaults to the first /dev/cu.usbserial-*
+#   ./deploy.sh [port]      # port defaults to the first /dev/cu.usbserial-* (CH340 adapter,
+#                           # WROOM) or /dev/cu.usbmodem* (native USB, XIAO ESP32-S3).
+#                           # Pass it explicitly if the Pico is plugged in over USB too.
 #
 # Why .mpy: compiling source on the board grows the MicroPython heap into the RAM that
 # WiFi and the MQTT TLS handshake need (see main.py). Needs mpy-cross matching the
 # board's MicroPython (1.29):  pip install "mpy-cross==1.29.*"
-# config.py, boot.py and mqtt_ca.pem are left as they are on the board.
+# config.py, boot.py and mqtt_ca.pem are left as they are on the board; on a fresh board
+# upload them once:  mpremote connect PORT cp config.py :config.py + cp mqtt_ca.pem :mqtt_ca.pem
 set -e
 cd "$(dirname "$0")"
 
 MODULES="bno08x compass gps bcu mqtt controller"
-PORT="${1:-$(ls /dev/cu.usbserial-* 2>/dev/null | head -1)}"
+PORT="${1:-$(ls /dev/cu.usbserial-* /dev/cu.usbmodem* 2>/dev/null | head -1)}"
 MPY_CROSS="${MPY_CROSS:-mpy-cross}"
 
 if [ -z "$PORT" ]; then

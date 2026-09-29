@@ -24,8 +24,8 @@
 // raw-passthrough build used for that).
 //
 // I2C peripheral: the latest fix is also served to an external I2C
-// controller (this board is the target, address 0x6D) on the header's
-// TX/RX pins — see "I2C fix readout" below for the packet layout.
+// controller (this board is the target, address 0x6D) on header pins
+// GPIO3 (SDA) / GPIO4 (SCL) — see "I2C fix readout" below for the packet layout.
 //
 // Resiliency (this runs on an autonomous bot): a loop watchdog, GNSS
 // link recovery, I2C stuck-bus recovery, non-blocking USB serial, and
@@ -43,14 +43,19 @@
 #define GNSS_UART Serial1
 #define GNSS_BAUD 9600
 
-// GPIO43/44 are UART0 TX/RX on the header. They're free because Serial
-// is USB-CDC on this board (ARDUINO_USB_CDC_ON_BOOT=1). SCL goes on 43
-// (the ROM's boot-log TX pin) rather than SDA: boot-log glitches on SCL
-// alone can't form an I2C START/STOP, glitches on SDA could.
-#define I2C_SCL_PIN 43
-#define I2C_SDA_PIN 44
+// GPIO3/4: the board's standard I2C pins on the header (SDA/SCL in the
+// Arduino variant), unused by anything else on the V4. Previously GPIO43/44
+// (the header's TX/RX), but those are the chip's UART0: the ROM prints its
+// boot log on 43 at every reset and drives it in download mode, which puts
+// noise on a shared bus. GPIO3 is a strapping pin (JTAG source select),
+// harmless here with the bus pull-up.
+#define I2C_SDA_PIN 3
+#define I2C_SCL_PIN 4
 #define I2C_ADDR 0x6D
-#define I2C_FREQ 400000
+// Must match the controller's bus speed: on the ESP32-S3 the target derives its SDA
+// sample/hold timing from this, and 400 kHz timing on the 100 kHz bus is suspected of
+// disturbing other devices' transfers when an ESP32-S3 is the controller.
+#define I2C_FREQ 100000
 
 const unsigned long BLINK_INTERVAL_MS = 3000;
 
@@ -89,9 +94,22 @@ static unsigned long i2cLastRestartMillis = 0;
 // The position fields always hold the last known fix (if any) so a
 // controller can still see where it last was, but when the module has no
 // fix, stops talking, or the fix is older than FIX_MAX_AGE_MS, FIX_VALID
-// is clear. Nothing (seq, ageMs base, utcTimeMs) changes without a new
-// fix actually arriving from the module.
-#define FIX_PACKET_VERSION 2
+// is clear. Nothing (seq, ageMs base) changes without a new fix actually
+// arriving from the module.
+//
+// v3 (2026-09-29) is 30 bytes, down from 44 in v2: the ESP32-S3's I2C TX
+// FIFO holds 32 bytes, and anything beyond that has to be refilled from an
+// interrupt during the read. With an ESP32-S3 controller that refill
+// sometimes didn't happen -- the read broke off after exactly 32 bytes and
+// the target then kept repeating one byte. At <= 32 bytes the refill path
+// is never used. Dropped: UTC time/date (unused; the controller has NTP);
+// narrowed: seq, ageMs, recovery counters.
+//
+// Read 31 bytes, not 30: the S3 target leaves the last byte of a response
+// it wasn't asked for in its output stage, and it comes out first in the
+// next read. Reading one byte more than the packet drains it; accept the
+// packet at offset 0 or 1 (check version + CRC).
+#define FIX_PACKET_VERSION 3
 #define FIX_FLAG_LINK_OK 0x01       // GNSS module is talking (valid GGA within GNSS_LINK_TIMEOUT_MS)
 #define FIX_FLAG_FIX_VALID 0x02     // module reports a real fix, and it's <= FIX_MAX_AGE_MS old
 #define FIX_FLAG_FIX_GOOD 0x04      // FIX_VALID and passes the sats/HDOP gate ("OK")
@@ -101,8 +119,8 @@ static unsigned long i2cLastRestartMillis = 0;
 struct __attribute__((packed)) FixPacket {
   uint8_t version;          // FIX_PACKET_VERSION
   uint8_t flags;            // FIX_FLAG_*
-  uint32_t seq;             // +1 per new fix; unchanged = same fix as last read (resets on reboot)
-  uint32_t ageMs;           // ms since that fix was parsed, at read time (UINT32_MAX = none yet)
+  uint16_t seq;             // +1 per new fix (wraps); unchanged = same fix as last read (resets on reboot)
+  uint16_t ageMs;           // ms since that fix was parsed, at read time, capped at 65534 (65535 = none yet)
   int32_t latE7;            // degrees * 1e7
   int32_t lonE7;            // degrees * 1e7
   int32_t altCm;            // altitude above mean sea level, cm
@@ -111,14 +129,13 @@ struct __attribute__((packed)) FixPacket {
   uint8_t fixQuality;       // GGA fix quality (1 = GPS, 2 = DGPS, ...)
   uint16_t sogKnotsX100;    // speed over ground, knots * 100
   uint16_t cogDegX100;      // course over ground, degrees * 100
-  uint32_t utcTimeMs;       // fix time, ms since UTC midnight
-  uint32_t utcDate;         // ddmmyy as a number, e.g. 260926 (0 = not seen yet)
-  uint16_t gnssRecoveries;  // times the GNSS module was power-cycled since boot
-  uint16_t i2cRecoveries;   // times the I2C peripheral was restarted since boot
+  uint8_t gnssRecoveries;   // times the GNSS module was power-cycled since boot (capped at 255)
+  uint8_t i2cRecoveries;    // times the I2C peripheral was restarted since boot (capped at 255)
   uint8_t resetReason;      // esp_reset_reason_t of the last boot (1 = power-on, 4 = panic, 6 = task WDT, 9 = brownout, ...)
   uint8_t crc;              // CRC-8/SMBUS (poly 0x07, init 0) over all bytes above
 };
-static_assert(sizeof(FixPacket) == 44, "FixPacket layout changed; bump FIX_PACKET_VERSION");
+static_assert(sizeof(FixPacket) == 30, "FixPacket layout changed; bump FIX_PACKET_VERSION");
+static_assert(sizeof(FixPacket) < 32, "FixPacket + the drained leftover byte must fit the 32-byte TX FIFO");
 
 // Written from loop(), read from the I2C driver's task — guard with fixMux.
 // latestFix.flags holds the last-set FIX_VALID/FIX_GOOD/MOTION_VALID/
@@ -208,7 +225,7 @@ void checkGNSSLink() {
   recoverGNSS();
   lastGnssRecoveryMillis = millis();
   portENTER_CRITICAL(&fixMux);
-  if (latestFix.gnssRecoveries < UINT16_MAX) {
+  if (latestFix.gnssRecoveries < UINT8_MAX) {
     latestFix.gnssRecoveries++;
   }
   portEXIT_CRITICAL(&fixMux);
@@ -260,17 +277,6 @@ int splitNmeaFields(const String &sentence, String fields[], int maxFields) {
     }
   }
   return count;
-}
-
-// Converts NMEA "hhmmss.sss" into milliseconds since UTC midnight.
-uint32_t nmeaTimeToMs(const String &raw) {
-  if (raw.length() < 6) {
-    return 0;
-  }
-  uint32_t hh = raw.substring(0, 2).toInt();
-  uint32_t mm = raw.substring(2, 4).toInt();
-  uint32_t secMs = (uint32_t)lround(raw.substring(4).toDouble() * 1000.0);
-  return (hh * 3600 + mm * 60) * 1000 + secMs;
 }
 
 // Parses a GGA sentence ($GNGGA/$GPGGA) and prints coordinates if there's a fix.
@@ -325,7 +331,6 @@ void handleGGA(const String &sentence) {
     latestFix.hdopX100 = lastHdop < 0.0 ? UINT16_MAX : (uint16_t)min(lround(lastHdop * 100.0), 65534L);
     latestFix.sats = (uint8_t)constrain(satellites, 0, 255);
     latestFix.fixQuality = (uint8_t)fixQuality;
-    latestFix.utcTimeMs = nmeaTimeToMs(fields[1]);
     latestFixMillis = now;
   } else {
     // Nothing new was measured: leave seq/timestamps/position alone and
@@ -380,7 +385,6 @@ void handleRMC(const String &sentence) {
   latestFix.flags |= FIX_FLAG_MOTION_VALID;
   latestFix.sogKnotsX100 = (uint16_t)constrain(lround(lastSpeedKnots * 100.0), 0L, 65535L);
   latestFix.cogDegX100 = (uint16_t)constrain(lround(lastCourseDeg * 100.0), 0L, 35999L);
-  latestFix.utcDate = count > 9 ? (uint32_t)fields[9].toInt() : 0;
   lastMotionMillis = now;
   portEXIT_CRITICAL(&fixMux);
 }
@@ -442,7 +446,7 @@ void onI2CRequest() {
 
   packet.version = FIX_PACKET_VERSION;
   bool hasPosition = packet.flags & FIX_FLAG_HAS_POSITION;
-  packet.ageMs = hasPosition ? (uint32_t)(now - fixMillis) : UINT32_MAX;
+  packet.ageMs = hasPosition ? (uint16_t)min(now - fixMillis, 65534UL) : UINT16_MAX;
   if (gga && now - ggaMillis <= GNSS_LINK_TIMEOUT_MS) {
     packet.flags |= FIX_FLAG_LINK_OK;
   } else {
@@ -489,7 +493,7 @@ void checkI2CBus() {
   i2cLastRestartMillis = millis();
   i2cLastIdleMillis = i2cLastRestartMillis;
   portENTER_CRITICAL(&fixMux);
-  if (latestFix.i2cRecoveries < UINT16_MAX) {
+  if (latestFix.i2cRecoveries < UINT8_MAX) {
     latestFix.i2cRecoveries++;
   }
   portEXIT_CRITICAL(&fixMux);

@@ -1,4 +1,7 @@
-"""Main vehicle controller (ESP32 WROOM, MicroPython). Started by main.py via run().
+"""Main vehicle controller (MicroPython). Started by main.py via run().
+
+Runs on a Seeed XIAO ESP32-S3 (8 MB PSRAM) or the original ESP32 WROOM dev board; the
+board is detected at startup and picks its pins from BOARD_PINS.
 
 One cooperative loop runs fixed-rate tasks; WiFi/MQTT run in their own threads (mqtt.py)
 so a network stall can't hold up the loop.
@@ -11,7 +14,7 @@ so a network stall can't hold up the loop.
   mqtt        1000 ms  handle received commands, queue telemetry
   report      1000 ms  console line, heartbeat LED, garbage collection
 
-The compass, the GPS board and the Pico share one I2C bus on GPIO21 (SDA) / GPIO22 (SCL):
+The compass, the GPS board and the Pico share one I2C bus (pins in BOARD_PINS):
 BNO08x at 0x4B, Heltec at 0x6D, Pico at 0x31.
 
 Resiliency -- this is an autonomous boat, so no single failure may stop the loop:
@@ -43,11 +46,12 @@ structure -- health checks first, then a decision with a reason -- is where it g
 import gc
 import json
 import os
+import sys
 import time
 
 import esp32
 import machine
-from machine import I2C, Pin
+from machine import I2C, Pin, SoftI2C
 
 from bcu import BodyControlUnit
 from gps import GpsLink
@@ -56,11 +60,37 @@ from gps import GpsLink
 # Controller.__init__.
 
 # ---- Pins ----
-I2C_SDA_PIN = 21
-I2C_SCL_PIN = 22
-I2C_FREQ = 100_000
+# Keyed by the start of the MicroPython build name (sys.implementation._build).
+BOARD_PINS = {
+    # Seeed XIAO ESP32-S3: I2C on the header's D4 (GPIO5) / D5 (GPIO6); user LED on GPIO21.
+    # D6/D7 (GPIO43/44) are UART0 on the header: the MicroPython console, kept for it.
+    # Software I2C at 50 kHz: with compass + Heltec + pull-ups on the bench wiring, the
+    # S3's hardware I2C failed at every speed (20-400 kHz) while bit-banged I2C worked
+    # cleanly up to 50 kHz (flaky at 100). Revisit with shorter wires / stronger pull-ups.
+    "ESP32_GENERIC_S3": {"name": "XIAO ESP32-S3", "sda": 5, "scl": 6, "led": 21,
+                         "soft_i2c": True, "i2c_freq": 50_000},
+    # ESP32 WROOM dev board: the default I2C pins; most of these boards put the LED on GPIO2.
+    "ESP32_GENERIC": {"name": "ESP32 WROOM", "sda": 21, "scl": 22, "led": 2,
+                      "soft_i2c": False, "i2c_freq": 100_000},
+}
+
+
+def detect_board():
+    build = getattr(sys.implementation, "_build", "")
+    # Longest key first, so "ESP32_GENERIC_S3-..." doesn't match "ESP32_GENERIC".
+    for key in sorted(BOARD_PINS, key=len, reverse=True):
+        if build.startswith(key):
+            return BOARD_PINS[key]
+    raise RuntimeError("unknown board build %r; add it to BOARD_PINS" % build)
+
+
+BOARD = detect_board()
+I2C_SDA_PIN = BOARD["sda"]
+I2C_SCL_PIN = BOARD["scl"]
+LED_PIN = BOARD["led"]
+I2C_SOFT = BOARD["soft_i2c"]
+I2C_FREQ = BOARD["i2c_freq"]
 I2C_TIMEOUT_US = 200_000  # the Heltec board stretches SCL while it builds its packet
-LED_PIN = 2  # most ESP32 WROOM dev boards route the onboard LED to GPIO2
 
 # ---- Task periods ----
 CONTROL_PERIOD_MS = 50  # 20 Hz; the Pico treats a command older than 750 ms as lost
@@ -95,6 +125,8 @@ RESET_CAUSES = {
 
 
 def make_i2c():
+    if I2C_SOFT:
+        return SoftI2C(sda=Pin(I2C_SDA_PIN), scl=Pin(I2C_SCL_PIN), freq=I2C_FREQ, timeout=I2C_TIMEOUT_US)
     return I2C(0, sda=Pin(I2C_SDA_PIN), scl=Pin(I2C_SCL_PIN), freq=I2C_FREQ, timeout=I2C_TIMEOUT_US)
 
 
@@ -400,6 +432,7 @@ class Controller:
                 "cog_deg": gps.cog_deg,
                 "age_ms": gps.age_ms,
                 "errors": {"i2c": gps.i2c_errors, "crc": gps.crc_errors, "version": gps.version_errors},
+                "shifted_reads": gps.shifted_reads,
             },
             "bcu": self.bcu.status_dict(),
             "bcu_errors": {
@@ -432,7 +465,8 @@ class Controller:
         if file_exists(PRODUCTION_FLAG_FILE):
             self.hold_boot_window()
             wdt = machine.WDT(timeout=WDT_MS)
-        print("controller running, reset cause: %s, watchdog: %s" % (
+        print("controller running on %s (%s I2C SDA=%d SCL=%d %d kHz), reset cause: %s, watchdog: %s" % (
+            BOARD["name"], "soft" if I2C_SOFT else "hw", I2C_SDA_PIN, I2C_SCL_PIN, I2C_FREQ // 1000,
             self.reset_cause, "on" if wdt else "off (dev mode)"))
 
         tasks = self.tasks

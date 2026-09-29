@@ -1,21 +1,30 @@
 """GNSS fix readout from the Heltec V4 board over I2C.
 
 The Heltec board (electronics/heltec_gnss_reader) reads its L76K and serves the latest fix
-as an I2C target at 0x6D. A plain 44-byte read returns a FixPacket v2 (layout in that
-project's src/main.cpp), little-endian, CRC-8/SMBUS in the last byte. Only FIX_VALID says
-the position is current; the position fields keep the last known fix after it's lost. The
-Heltec board stretches SCL while it builds the packet, so the bus needs an I2C timeout that
-allows for it. A board that hasn't answered with a good packet for lost_ms is treated the
-same as "no fix".
+as an I2C target at 0x6D: a FixPacket v3, 30 bytes (layout in that project's src/main.cpp),
+little-endian, CRC-8/SMBUS in the last byte. Only FIX_VALID says the position is current;
+the position fields keep the last known fix after it's lost. The Heltec board stretches
+SCL while it answers, so the bus needs an I2C timeout that allows for it. A board that
+hasn't answered with a good packet for lost_ms is treated the same as "no fix".
+
+Read quirk of the ESP32-S3 target: it keeps the last byte of a response the controller
+stopped reading before in its output stage, and that byte comes out first in the next
+read. So one byte more than the packet is read (which drains it), a packet is accepted at
+offset 0 or 1 if its version and CRC match there, and a bad read is retried once right
+away. v3 is kept under the target's 32-byte TX FIFO on purpose; see the Heltec's
+DECISIONS.md.
 """
 
 import struct
 import time
 
 GPS_I2C_ADDR = 0x6D
-GPS_PACKET_FORMAT = "<BBIIiiiHBBHHIIHHBB"  # FixPacket v2
-GPS_PACKET_LEN = 44
-GPS_PACKET_VERSION = 2
+GPS_PACKET_FORMAT = "<BBHHiiiHBBHHBBBB"  # FixPacket v3
+GPS_PACKET_LEN = 30
+GPS_READ_LEN = GPS_PACKET_LEN + 1  # one extra byte drains the target's leftover, see the docstring
+GPS_PACKET_OFFSETS = (0, 1)
+GPS_READ_ATTEMPTS = 2  # per poll: one immediate retry after a bad read
+GPS_PACKET_VERSION = 3
 GPS_LOST_MS = 1000  # no good packet for this long = treat as no fix
 
 FLAG_LINK_OK = 0x01  # GNSS module is talking to the Heltec board
@@ -42,19 +51,21 @@ class GpsLink:
         self.i2c = i2c
         self.addr = addr
         self.lost_ms = lost_ms
-        self.buf = bytearray(GPS_PACKET_LEN)
+        self.buf = bytearray(GPS_READ_LEN)
+        self.view = memoryview(self.buf)
         self.stamp = 0
         self.seen = False
 
         # Failed reads, by cause: the bus (NACK or timeout) vs. the data that came back.
         self.i2c_errors = 0
-        self.crc_errors = 0
+        self.crc_errors = 0  # no valid packet at any accepted offset
         self.version_errors = 0
+        self.shifted_reads = 0  # good packets found at offset 1 (the read quirk)
 
         # Fields of the last good packet; see FixPacket in the Heltec project.
         self.flags = 0
         self.seq = 0
-        self.age_ms = 0  # fix age at the moment of the read
+        self.age_ms = 0  # fix age at the moment of the read (capped at 65534)
         self.lat = 0.0
         self.lon = 0.0
         self.alt_m = 0.0
@@ -63,31 +74,47 @@ class GpsLink:
         self.fix_quality = 0
         self.sog_kn = 0.0
         self.cog_deg = 0.0
-        self.utc_ms = 0
-        self.utc_date = 0
         self.gnss_recoveries = 0
         self.i2c_recoveries = 0
         self.reset_reason = 0
 
     def poll(self, now):
-        """One read attempt. Returns True if a good packet arrived."""
+        """Reads the board, retrying once on a bad read. Returns True if a good packet arrived."""
+        for _ in range(GPS_READ_ATTEMPTS):
+            offset = self._read()
+            if offset is not None:
+                self._unpack(offset, now)
+                return True
+        return False
+
+    def _read(self):
+        """One read; the offset of a good packet in self.buf, or None."""
         buf = self.buf
         try:
             self.i2c.readfrom_into(self.addr, buf)
         except OSError:
             self.i2c_errors += 1  # NACK (board resetting or not wired) or bus timeout
-            return False
-        if crc8(buf, GPS_PACKET_LEN - 1) != buf[-1]:
-            self.crc_errors += 1
-            return False
-        if buf[0] != GPS_PACKET_VERSION:
+            return None
+        crc_ok = False
+        for offset in GPS_PACKET_OFFSETS:
+            if crc8(self.view[offset:], GPS_PACKET_LEN - 1) != buf[offset + GPS_PACKET_LEN - 1]:
+                continue
+            crc_ok = True
+            if buf[offset] == GPS_PACKET_VERSION:
+                if offset:
+                    self.shifted_reads += 1
+                return offset
+        if crc_ok:
             self.version_errors += 1
-            return False
+        else:
+            self.crc_errors += 1
+        return None
 
+    def _unpack(self, offset, now):
         (_version, self.flags, self.seq, self.age_ms, lat_e7, lon_e7, alt_cm, hdop_x100,
-         self.sats, self.fix_quality, sog_x100, cog_x100, self.utc_ms, self.utc_date,
+         self.sats, self.fix_quality, sog_x100, cog_x100,
          self.gnss_recoveries, self.i2c_recoveries, self.reset_reason,
-         _crc) = struct.unpack(GPS_PACKET_FORMAT, buf)
+         _crc) = struct.unpack_from(GPS_PACKET_FORMAT, self.buf, offset)
         self.lat = lat_e7 / 1e7
         self.lon = lon_e7 / 1e7
         self.alt_m = alt_cm / 100

@@ -119,18 +119,40 @@ often as it likes while the L76K stays at the proven 9600 / 1Hz setup.
 
 - **Role/address**: this board is the I2C *target*, address `0x6D`, on
   `Wire1` (keeps `Wire` free for the onboard OLED on GPIO17/18).
-- **Pins**: SCL = GPIO43, SDA = GPIO44 (the header's TX/RX). Free because
-  `Serial` is USB-CDC (`ARDUINO_USB_CDC_ON_BOOT=1`). GPIO41/42 were
-  considered and rejected — they're `GNSS_PPS` / `GNSS_RST` on the V4
-  (they were the I2C pins on the V3, which is likely where that came from).
-  SCL is on 43 because the ROM prints its boot log on GPIO43: glitches on
-  SCL alone can't form a START/STOP, on SDA they could. Still, expect a
-  burst of noise on SCL for ~100ms after every reset.
-- **Protocol**: a plain read of 44 bytes returns a `FixPacket` v2 (layout
-  documented in `src/main.cpp`), little-endian, CRC-8/SMBUS in the last
-  byte. `seq` increments per new fix; `ageMs` is computed at the moment of
-  each read. Position fields keep the last known fix when the fix is lost,
-  but `FIX_VALID` is then clear — that flag is the one to check.
+- **Pins**: SDA = GPIO3, SCL = GPIO4 — the board's standard I2C header
+  pins (`SDA`/`SCL` in the Arduino variant), unused by anything else on the
+  V4. GPIO3 is a strapping pin (JTAG source select), harmless with the bus
+  pull-up. GPIO41/42 were considered and rejected — they're `GNSS_PPS` /
+  `GNSS_RST` on the V4 (they were the I2C pins on the V3).
+  - *Changed 2026-09-29 from GPIO43/44* (the header's TX/RX). Those are the
+    chip's UART0: the ROM prints its boot log on GPIO43 at every reset, and
+    in download (bootloader) mode it actively drives GPIO43 — which on a
+    shared bus means the clock line is held high. With an ESP32-S3
+    (XIAO) as controller, packets also came back shifted by one byte and a
+    BNO08x on the same bus failed to initialize whenever this board was
+    connected; whether the move fixes that is being tested.
+  - Also tried and ruled out for that problem: bus speed (20–400 kHz),
+    the target's `I2C_FREQ` setting (400 kHz → 100 kHz, kept at 100 kHz to
+    match the bus), pull-ups, power supply, and pre-loading the TX FIFO
+    with `slaveWrite` (made reads come back empty; reverted).
+- **Protocol**: a `FixPacket` v3, 30 bytes (layout documented in
+  `src/main.cpp`), little-endian, CRC-8/SMBUS in the last byte. `seq`
+  increments per new fix; `ageMs` is computed at the moment of each read.
+  Position fields keep the last known fix when the fix is lost, but
+  `FIX_VALID` is then clear — that flag is the one to check.
+  - **Read 31 bytes and accept the packet at offset 0 or 1** (check the
+    version byte and CRC). The ESP32-S3 target keeps the last byte of a
+    response in its output stage when the controller stops reading before
+    it; that byte comes out first in the next read. One extra byte drains
+    it, so after the first read the packet arrives at offset 0.
+  - *v3 (2026-09-29) replaced the 44-byte v2.* The ESP32-S3 TX FIFO holds
+    32 bytes; a longer response is refilled from an interrupt mid-read, and
+    with an ESP32-S3 controller that refill sometimes didn't happen (the
+    read broke off at exactly 32 bytes and the target then repeated one
+    byte for following reads). Dropped UTC time/date (unused — the
+    controller has NTP); narrowed `seq`/`ageMs` to 16 bits and the
+    recovery counters to 8 bits. A classic-ESP32 controller (WROOM) read
+    v2 cleanly with 44-byte reads.
 - **Controller requirements**: pull-ups (e.g. 4.7kΩ to 3.3V), shared GND,
   3.3V logic, and support for **clock stretching** — the ESP32-S3 holds
   SCL low while the request callback runs. The Raspberry Pi's hardware
@@ -149,7 +171,7 @@ don't currently have, and never invent a new timestamp without new data.**
   GGA sentences (fix or not) keep arriving, within 3s. Fix qualities 6-8
   (estimated/manual/simulated) are not treated as fixes. Out-of-range
   coordinates are rejected.
-- **No new data, no new timestamp.** `seq`, `utcTimeMs` and the base of
+- **No new data, no new timestamp.** `seq` and the base of
   `ageMs` only change when a GGA with a real fix is parsed. A no-fix GGA
   only clears the validity flags.
 - **GNSS link recovery.** No valid GGA for 5s → `recoverGNSS()`: UART off,
