@@ -9,13 +9,13 @@ so a network stall can't hold up the loop.
   task        period   what
   control       50 ms  decide throttle/rudder, send to the body control unit (bcu.py)
   compass      100 ms  read heading (compass.py)
-  gps          200 ms  read the latest fix from the Heltec board (gps.py)
+  gps          100 ms  read NMEA from the L76K GNSS module on a UART (gps.py)
   bcu_status  1000 ms  read the Pico's status block
   mqtt        1000 ms  handle received commands, queue telemetry
   report      1000 ms  console line, heartbeat LED, garbage collection
 
-The compass, the GPS board and the Pico share one I2C bus (pins in BOARD_PINS):
-BNO08x at 0x4B, Heltec at 0x6D, Pico at 0x31.
+The compass and the Pico share one I2C bus (pins in BOARD_PINS): BNO08x at 0x4B, Pico at
+0x31. The L76K GNSS module has its own UART (pins in BOARD_PINS).
 
 Resiliency -- this is an autonomous boat, so no single failure may stop the loop:
   - Every task runs inside its own try/except. An exception is counted, logged (rate-
@@ -64,14 +64,22 @@ from gps import GpsLink
 BOARD_PINS = {
     # Seeed XIAO ESP32-S3: I2C on the header's D4 (GPIO5) / D5 (GPIO6); user LED on GPIO21.
     # D6/D7 (GPIO43/44) are UART0 on the header: the MicroPython console, kept for it.
-    # Software I2C at 50 kHz: with compass + Heltec + pull-ups on the bench wiring, the
-    # S3's hardware I2C failed at every speed (20-400 kHz) while bit-banged I2C worked
-    # cleanly up to 50 kHz (flaky at 100). Revisit with shorter wires / stronger pull-ups.
+    # Software I2C at 50 kHz: the BNO08x compass doesn't work with the S3's hardware I2C
+    # (2026-10-03, Heltec gone, compass freshly power-cycled: it shows up in a scan but
+    # init fails with ENODEV at 100 kHz, then it drops off the bus until power-cycled).
+    # Bit-banged I2C works, with occasional compass read errors; while the compass
+    # misbehaves, the Pico's status reads also fail their checksum more often. The Pico
+    # alone is fine on hardware I2C up to 400 kHz. Fix for later: compass on UART-RVC or
+    # on its own bus.
+    # L76K on UART1: D10 (GPIO9) = RX <- module TX, D9 (GPIO8) = TX -> module RX.
     "ESP32_GENERIC_S3": {"name": "XIAO ESP32-S3", "sda": 5, "scl": 6, "led": 21,
-                         "soft_i2c": True, "i2c_freq": 50_000},
+                         "soft_i2c": True, "i2c_freq": 50_000,
+                         "gnss_uart": 1, "gnss_rx": 9, "gnss_tx": 8},
     # ESP32 WROOM dev board: the default I2C pins; most of these boards put the LED on GPIO2.
+    # L76K on UART2's usual pins (not tried on this board).
     "ESP32_GENERIC": {"name": "ESP32 WROOM", "sda": 21, "scl": 22, "led": 2,
-                      "soft_i2c": False, "i2c_freq": 100_000},
+                      "soft_i2c": False, "i2c_freq": 100_000,
+                      "gnss_uart": 2, "gnss_rx": 16, "gnss_tx": 17},
 }
 
 
@@ -90,13 +98,13 @@ I2C_SCL_PIN = BOARD["scl"]
 LED_PIN = BOARD["led"]
 I2C_SOFT = BOARD["soft_i2c"]
 I2C_FREQ = BOARD["i2c_freq"]
-I2C_TIMEOUT_US = 200_000  # the Heltec board stretches SCL while it builds its packet
+I2C_TIMEOUT_US = 200_000  # generous: a target may stretch SCL
 
 # ---- Task periods ----
 CONTROL_PERIOD_MS = 50  # 20 Hz; the Pico treats a command older than 750 ms as lost
 COMPASS_PERIOD_MS = 100  # 10 Hz
-GPS_PERIOD_MS = 200  # 5 Hz, though the GNSS module produces 1 fix/s: the Heltec's I2C target
-# fails ~35-40% of reads with the XIAO (see its DECISIONS.md), so poll often and ride it out
+GPS_PERIOD_MS = 100  # the module sends 1 fix/s; polling often keeps fix timestamps close
+# to when it arrived, and the UART buffers what comes in between
 BCU_STATUS_PERIOD_MS = 1000
 MQTT_PERIOD_MS = 1000
 REPORT_PERIOD_MS = 1000
@@ -105,7 +113,6 @@ REPORT_PERIOD_MS = 1000
 COMPASS_MAX_AGE_MS = 500  # a heading older than this isn't used for control
 COMPASS_LOST_MS = 3000  # no new heading for this long = re-initialize the sensor
 COMPASS_RETRY_MS = 10000  # at most this often (init blocks for ~1 s)
-GPS_LOST_MS = 2000  # Heltec board not answering for this long = no fix (10 missed polls)
 I2C_RECOVERY_AFTER_FAILS = 20  # consecutive failed writes to the Pico (1 s at 20 Hz)
 I2C_RECOVERY_INTERVAL_MS = 5000  # doubles after each recovery that didn't help...
 I2C_RECOVERY_MAX_INTERVAL_MS = 60000  # ...up to this; back to the start on a good write
@@ -230,7 +237,7 @@ class Controller:
         gc.collect()
         self.mqtt = self.start_mqtt()
 
-        self.gps = GpsLink(self.i2c, lost_ms=GPS_LOST_MS)
+        self.gps = GpsLink(BOARD["gnss_uart"], BOARD["gnss_rx"], BOARD["gnss_tx"], time.ticks_ms())
         self.compass = None
         self.compass_attempt = None
         self.compass_inits = 0
@@ -392,7 +399,6 @@ class Controller:
         unstick_i2c_bus()
         self.i2c = make_i2c()
         self.bcu.i2c = self.i2c
-        self.gps.i2c = self.i2c
         if self.compass is not None:
             self.compass.bno._i2c = self.i2c  # the driver keeps its own reference
         self.i2c_fail_streak = 0
@@ -407,7 +413,6 @@ class Controller:
         return "task errors: " + (", ".join(failing) if failing else "none")
 
     def telemetry(self, now):
-        gps = self.gps
         compass = self.compass
         return {
             "uptime_s": time.ticks_diff(now, self.boot_ms) // 1000,
@@ -420,21 +425,7 @@ class Controller:
                 "fresh": compass.fresh(now, COMPASS_MAX_AGE_MS),
                 "inits": self.compass_inits,
             },
-            "gps": {
-                "answering": gps.answering(now),
-                "fix_valid": gps.fix_valid(now),
-                "fix_good": gps.fix_good(now),
-                "lat": gps.lat,
-                "lon": gps.lon,
-                "alt_m": gps.alt_m,
-                "sats": gps.sats,
-                "hdop": gps.hdop,
-                "sog_kn": gps.sog_kn,
-                "cog_deg": gps.cog_deg,
-                "age_ms": gps.age_ms,
-                "errors": {"i2c": gps.i2c_errors, "crc": gps.crc_errors, "version": gps.version_errors},
-                "shifted_reads": gps.shifted_reads,
-            },
+            "gps": self.gps.status_dict(now),
             "bcu": self.bcu.status_dict(),
             "bcu_errors": {
                 "write": self.bcu.write_errors,

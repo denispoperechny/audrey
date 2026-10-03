@@ -1,156 +1,361 @@
-"""GNSS fix readout from the Heltec V4 board over I2C.
+"""GNSS fixes from the Quectel L76K, wired straight to a UART of this board.
 
-The Heltec board (electronics/heltec_gnss_reader) reads its L76K and serves the latest fix
-as an I2C target at 0x6D: a FixPacket v3, 30 bytes (layout in that project's src/main.cpp),
-little-endian, CRC-8/SMBUS in the last byte. Only FIX_VALID says the position is current;
-the position fields keep the last known fix after it's lost. The Heltec board stretches
-SCL while it answers, so the bus needs an I2C timeout that allows for it. A board that
-hasn't answered with a good packet for lost_ms is treated the same as "no fix".
+Replaces the Heltec V4 board (electronics/heltec_gnss_reader), which read the L76K and
+served fixes over I2C (the old reader is kept as gnss_i2c.py). This module does what that
+firmware's src/main.cpp did, with the same rules -- see its DECISIONS.md for the why:
 
-Read quirk of the ESP32-S3 target: it keeps the last byte of a response the controller
-stopped reading before in its output stage, and that byte comes out first in the next
-read. So one byte more than the packet is read (which drains it), a packet is accepted at
-offset 0 or 1 if its version and CRC match there, and a bad read is retried once right
-away. v3 is kept under the target's 32-byte TX FIFO on purpose; see the Heltec's
-DECISIONS.md.
+  - The L76K (AT6558R chip) takes CASIC "$PCAS" commands, not MediaTek "$PMTK", and never
+    acknowledges them. It also keeps PCAS settings across resets, so every value is sent
+    on every start: GPS + BeiDou, 1 Hz, only GGA/GSA/RMC. Baud and fix rate stay at the
+    proven 9600 / 1 Hz.
+  - Sentences are only used with a valid checksum; a '$' always starts a new sentence.
+  - A fix is GGA quality 1-5 with in-range coordinates (6-8 are estimated / manual /
+    simulated). It is "good" with >= 4 satellites and HDOP (from GSA) <= 2.5, or no HDOP
+    seen yet. Speed/course come from RMC, only when it reports itself valid ('A').
+  - Nothing is used stale: a fix older than FIX_MAX_AGE_MS (one missed 1 Hz fix plus
+    margin) isn't valid, and a GGA without a fix invalidates the last one right away. The
+    position fields keep the last known fix, but only fix_valid() says it's current.
+    seq and the fix stamp only change when a new fix arrives.
+  - The link is up while checksum-valid GGA sentences (fix or not) keep arriving. Silent
+    for GNSS_RECOVERY_AFTER_MS: re-initialize the UART, send "9600 baud" at 115200 (in
+    case a past session left the module there; the chip keeps that too), go back to 9600
+    and re-send the config. At most every GNSS_RECOVERY_INTERVAL_MS. The Heltec also
+    power-cycled the module; only TX/RX are wired here, so that part is left out.
+
+Differences from the Heltec firmware, because this runs inside the controller's loop:
+  - PCAS commands are queued and sent one per poll() instead of with blocking 100 ms
+    delays in between, so a (re)configuration never holds up the loop.
+  - Fix and RMC times are stamped when poll() reads them, up to one poll period after the
+    module sent them (the Heltec read in a tight loop).
+  - Coordinates are parsed into integer degrees * 1e7 (lat_e7 / lon_e7): MicroPython
+    floats are 32-bit here, about half a metre of rounding at these magnitudes. lat / lon
+    are float conveniences for display.
 """
 
-import struct
 import time
 
-GPS_I2C_ADDR = 0x6D
-GPS_PACKET_FORMAT = "<BBHHiiiHBBHHBBBB"  # FixPacket v3
-GPS_PACKET_LEN = 30
-GPS_READ_LEN = GPS_PACKET_LEN + 1  # one extra byte drains the target's leftover, see the docstring
-GPS_PACKET_OFFSETS = (0, 1)
-GPS_READ_ATTEMPTS = 2  # per poll: one immediate retry after a bad read
-GPS_PACKET_VERSION = 3
-GPS_LOST_MS = 1000  # no good packet for this long = treat as no fix
+from machine import UART
 
-FLAG_LINK_OK = 0x01  # GNSS module is talking to the Heltec board
-FLAG_FIX_VALID = 0x02  # real fix, <= 2.5 s old -- the one to check before using position
-FLAG_FIX_GOOD = 0x04  # FIX_VALID and passes the sats/HDOP gate
-FLAG_MOTION_VALID = 0x08  # sog/cog are current
-FLAG_HAS_POSITION = 0x10  # position fields hold a last known fix (may be stale)
+GNSS_BAUD = 9600
+RESCUE_BAUD = 115200
+
+FIX_MAX_AGE_MS = 2500  # a 1 Hz fix older than this (one missed fix + margin) isn't current
+LINK_TIMEOUT_MS = 3000  # no checksum-valid GGA (fix or not) for this long = link down
+GNSS_RECOVERY_AFTER_MS = 5000  # ...and for this long = try to recover the module,
+GNSS_RECOVERY_INTERVAL_MS = 10000  # at most this often
+MAX_SENTENCE_LEN = 120  # NMEA allows 82; longer = corrupt / unterminated, dropped
+
+GOOD_FIX_MIN_SATS = 4
+GOOD_FIX_MAX_HDOP = 2.5
+
+CONFIG_COMMANDS = (
+    "PCAS04,3",  # GPS + BeiDou
+    "PCAS02,1000",  # 1 Hz fix rate
+    "PCAS03,1,0,1,0,1,0,0,0,0,0,,,0,0",  # GGA/GSA/RMC every fix; GLL/GSV/VTG/ZDA/ANT off
+)
+RESCUE_COMMAND = "PCAS01,1"  # 1 = 9600 baud; just noise to a module already at 9600
 
 
-def crc8(data, length):
-    """CRC-8/SMBUS: poly 0x07, init 0x00, no reflection."""
-    crc = 0
-    for i in range(length):
-        crc ^= data[i]
-        for _ in range(8):
-            crc = ((crc << 1) ^ 0x07) & 0xFF if crc & 0x80 else (crc << 1) & 0xFF
-    return crc
+def pcas_sentence(body):
+    """'$<body>*XX\\r\\n' with the NMEA checksum, e.g. body = 'PCAS04,3'."""
+    checksum = 0
+    for ch in body:
+        checksum ^= ord(ch)
+    return "$%s*%02X\r\n" % (body, checksum)
+
+
+def checked_body(line):
+    """The part between '$' and '*' of a sentence with a valid checksum, else None."""
+    star = line.rfind(b"*")
+    if line[:1] != b"$" or star < 1 or star + 2 >= len(line):
+        return None
+    checksum = 0
+    for b in line[1:star]:
+        checksum ^= b
+    try:
+        expected = int(line[star + 1:star + 3], 16)
+    except ValueError:
+        return None
+    return line[1:star] if checksum == expected else None
+
+
+def coord_e7(raw, hemisphere):
+    """NMEA 'ddmm.mmmm' / 'dddmm.mmmm' + hemisphere -> degrees * 1e7, or None."""
+    whole, _, fraction = raw.partition(".")
+    if len(whole) < 3 or not whole.isdigit() or (fraction and not fraction.isdigit()):
+        return None
+    degrees, minutes = divmod(int(whole), 100)
+    if minutes >= 60:
+        return None
+    minutes_e7 = minutes * 10_000_000 + int((fraction + "0000000")[:7])
+    value = degrees * 10_000_000 + (minutes_e7 + 30) // 60
+    return -value if hemisphere in ("S", "W") else value
+
+
+def to_float(raw, default=0.0):
+    try:
+        return float(raw)
+    except ValueError:
+        return default
+
+
+def to_int(raw, default=0):
+    try:
+        return int(raw)
+    except ValueError:
+        return default
+
+
+def format_e7(value):
+    sign = "-" if value < 0 else ""
+    value = abs(value)
+    return "%s%d.%07d" % (sign, value // 10_000_000, value % 10_000_000)
 
 
 class GpsLink:
-    """Polls the Heltec board and keeps the last good fix packet."""
+    """Reads the L76K on a UART; call poll(now) often (every 100-200 ms)."""
 
-    def __init__(self, i2c, addr=GPS_I2C_ADDR, lost_ms=GPS_LOST_MS):
-        self.i2c = i2c
-        self.addr = addr
-        self.lost_ms = lost_ms
-        self.buf = bytearray(GPS_READ_LEN)
-        self.view = memoryview(self.buf)
-        self.stamp = 0
-        self.seen = False
+    def __init__(self, uart_id, rx, tx, now):
+        self.uart_id = uart_id
+        self.rx = rx
+        self.tx = tx
+        self.uart = None
+        self.baud = None
+        self.pending = []  # (baud, PCAS body) still to send, one per poll()
+        self.buf = b""
 
-        # Failed reads, by cause: the bus (NACK or timeout) vs. the data that came back.
-        self.i2c_errors = 0
-        self.crc_errors = 0  # no valid packet at any accepted offset
-        self.version_errors = 0
-        self.shifted_reads = 0  # good packets found at offset 1 (the read quirk)
+        # Counters.
+        self.sentences = 0  # checksum-valid sentences
+        self.checksum_errors = 0
+        self.overflows = 0  # over-long lines dropped
+        self.recoveries = 0
+        self.seq = 0  # +1 per new fix (fixes since start)
 
-        # Fields of the last good packet; see FixPacket in the Heltec project.
-        self.flags = 0
-        self.seq = 0
-        self.age_ms = 0  # fix age at the moment of the read (capped at 65534)
+        # Link / recovery timing. Counted from now, so the module gets a full window first.
+        self.gga_seen = False
+        self.last_gga = now
+        self.last_recovery = now
+
+        # Last known fix; see fix_valid() before using it.
+        self.has_position = False
+        self.fix_flag = False  # the latest GGA reported a fix
+        self.good_flag = False  # ...that passed the sats/HDOP gate
+        self.fix_stamp = now
+        self.lat_e7 = 0
+        self.lon_e7 = 0
         self.lat = 0.0
         self.lon = 0.0
         self.alt_m = 0.0
-        self.hdop = None  # None = the board hasn't seen HDOP yet
-        self.sats = 0
+        self.sats = 0  # satellites used in the last fix
         self.fix_quality = 0
+        self.hdop = None  # from GSA; None = not seen yet
+        self.gga_sats = 0  # satellites in the latest GGA, fix or not (for the console)
+        self.gga_quality = 0
+
+        # Motion, from RMC.
+        self.motion_flag = False
+        self.motion_stamp = now
         self.sog_kn = 0.0
         self.cog_deg = 0.0
-        self.gnss_recoveries = 0
-        self.i2c_recoveries = 0
-        self.reset_reason = 0
+
+        self._open(GNSS_BAUD)
+        self._queue_config()
+
+    # ---- UART / module config --------------------------------------------------------
+
+    def _open(self, baud):
+        if self.uart is None:
+            self.uart = UART(self.uart_id, baudrate=baud, rx=self.rx, tx=self.tx, rxbuf=2048)
+        else:
+            self.uart.init(baudrate=baud, rx=self.rx, tx=self.tx, rxbuf=2048)
+        self.baud = baud
+
+    def _queue_config(self):
+        self.pending.extend((GNSS_BAUD, body) for body in CONFIG_COMMANDS)
+
+    def _send_pending(self):
+        """Sends one queued command. The previous one has had a whole poll period to go
+        out, so switching the baud rate here doesn't cut it off."""
+        if not self.pending:
+            return
+        baud, body = self.pending.pop(0)
+        if baud != self.baud:
+            self._open(baud)
+            self.buf = b""  # bytes received at the old rate are garbage now
+        self.uart.write(pcas_sentence(body))
+
+    def _check_link(self, now):
+        silent_ms = time.ticks_diff(now, self.last_gga)
+        if silent_ms < GNSS_RECOVERY_AFTER_MS:
+            return
+        if time.ticks_diff(now, self.last_recovery) < GNSS_RECOVERY_INTERVAL_MS:
+            return
+        print("gps: no data for %d ms, re-initializing the GNSS module" % silent_ms)
+        self.last_recovery = now
+        self.recoveries += 1
+        self.pending = [(RESCUE_BAUD, RESCUE_COMMAND)]
+        self._queue_config()
+
+    # ---- reading ---------------------------------------------------------------------
 
     def poll(self, now):
-        """Reads the board, retrying once on a bad read. Returns True if a good packet arrived."""
-        for _ in range(GPS_READ_ATTEMPTS):
-            offset = self._read()
-            if offset is not None:
-                self._unpack(offset, now)
-                return True
-        return False
+        """Reads what the module sent, sends one queued command, checks the link."""
+        data = self.uart.read()
+        if data:
+            self._feed(data, now)
+        self._send_pending()
+        self._check_link(now)
 
-    def _read(self):
-        """One read; the offset of a good packet in self.buf, or None."""
-        buf = self.buf
-        try:
-            self.i2c.readfrom_into(self.addr, buf)
-        except OSError:
-            self.i2c_errors += 1  # NACK (board resetting or not wired) or bus timeout
-            return None
-        crc_ok = False
-        for offset in GPS_PACKET_OFFSETS:
-            if crc8(self.view[offset:], GPS_PACKET_LEN - 1) != buf[offset + GPS_PACKET_LEN - 1]:
+    def _feed(self, data, now):
+        buf = self.buf + data
+        while True:
+            end = buf.find(b"\n")
+            if end < 0:
+                break
+            line = buf[:end]
+            buf = buf[end + 1:]
+            start = line.rfind(b"$")  # resync: a '$' always starts a new sentence
+            if start < 0:
                 continue
-            crc_ok = True
-            if buf[offset] == GPS_PACKET_VERSION:
-                if offset:
-                    self.shifted_reads += 1
-                return offset
-        if crc_ok:
-            self.version_errors += 1
-        else:
-            self.crc_errors += 1
-        return None
+            line = line[start:].strip()
+            if len(line) > MAX_SENTENCE_LEN:
+                self.overflows += 1
+                continue
+            self._handle_line(line, now)
+        if len(buf) > MAX_SENTENCE_LEN:
+            # No newline in sight: keep only a sentence that may still be in progress.
+            start = buf.rfind(b"$")
+            buf = buf[start:] if start >= 0 and len(buf) - start <= MAX_SENTENCE_LEN else b""
+            self.overflows += 1
+        self.buf = buf
 
-    def _unpack(self, offset, now):
-        (_version, self.flags, self.seq, self.age_ms, lat_e7, lon_e7, alt_cm, hdop_x100,
-         self.sats, self.fix_quality, sog_x100, cog_x100,
-         self.gnss_recoveries, self.i2c_recoveries, self.reset_reason,
-         _crc) = struct.unpack_from(GPS_PACKET_FORMAT, self.buf, offset)
-        self.lat = lat_e7 / 1e7
-        self.lon = lon_e7 / 1e7
-        self.alt_m = alt_cm / 100
-        self.hdop = None if hdop_x100 == 0xFFFF else hdop_x100 / 100
-        self.sog_kn = sog_x100 / 100
-        self.cog_deg = cog_x100 / 100
-        self.stamp = now
-        self.seen = True
-        return True
+    def _handle_line(self, line, now):
+        body = checked_body(line)
+        if body is None:
+            self.checksum_errors += 1
+            return
+        self.sentences += 1
+        try:
+            fields = body.decode().split(",")
+        except UnicodeError:
+            return
+        kind = fields[0][2:5]  # "GNGGA" -> "GGA"
+        if kind == "GGA":
+            self._handle_gga(fields, now)
+        elif kind == "GSA":
+            self._handle_gsa(fields)
+        elif kind == "RMC":
+            self._handle_rmc(fields, now)
 
-    def answering(self, now):
-        return self.seen and time.ticks_diff(now, self.stamp) <= self.lost_ms
+    def _handle_gga(self, f, now):
+        if len(f) < 10:
+            return
+        quality = to_int(f[6])
+        sats = to_int(f[7])
+        self.last_gga = now  # any valid GGA proves the link is alive, fix or not
+        self.gga_seen = True
+        self.gga_sats = sats
+        self.gga_quality = quality
+
+        lat = lon = None
+        if 1 <= quality <= 5:
+            lat = coord_e7(f[2], f[3])
+            lon = coord_e7(f[4], f[5])
+        if lat is None or lon is None or abs(lat) > 900_000_000 or abs(lon) > 1_800_000_000:
+            # Nothing new was measured: leave seq/stamp/position alone and just stop
+            # vouching for the old fix.
+            self.fix_flag = False
+            self.good_flag = False
+            return
+
+        self.seq += 1
+        self.has_position = True
+        self.fix_flag = True
+        self.good_flag = sats >= GOOD_FIX_MIN_SATS and (self.hdop is None or self.hdop <= GOOD_FIX_MAX_HDOP)
+        self.fix_stamp = now
+        self.lat_e7 = lat
+        self.lon_e7 = lon
+        self.lat = lat / 1e7
+        self.lon = lon / 1e7
+        self.alt_m = to_float(f[9])
+        self.sats = sats
+        self.fix_quality = quality
+
+    def _handle_gsa(self, f):
+        if len(f) < 17:
+            return
+        hdop = to_float(f[16])
+        if hdop > 0:
+            self.hdop = hdop
+
+    def _handle_rmc(self, f, now):
+        if len(f) < 9:
+            return
+        if f[2] != "A":
+            self.motion_flag = False
+            return
+        self.motion_flag = True
+        self.motion_stamp = now
+        self.sog_kn = to_float(f[7])  # empty when not moving: 0
+        self.cog_deg = to_float(f[8])
+
+    # ---- state -----------------------------------------------------------------------
+
+    def link_ok(self, now):
+        """The module is talking: a valid GGA (fix or not) within LINK_TIMEOUT_MS."""
+        return self.gga_seen and time.ticks_diff(now, self.last_gga) <= LINK_TIMEOUT_MS
+
+    def fix_age_ms(self, now):
+        """ms since the last fix was read, or None if there never was one."""
+        return time.ticks_diff(now, self.fix_stamp) if self.has_position else None
 
     def fix_valid(self, now):
-        """Board answering and the position is current -- check before using lat/lon."""
-        return self.answering(now) and bool(self.flags & FLAG_FIX_VALID)
+        """Real fix, not older than FIX_MAX_AGE_MS -- check before using the position."""
+        return self.fix_flag and self.has_position and time.ticks_diff(now, self.fix_stamp) <= FIX_MAX_AGE_MS
 
     def fix_good(self, now):
-        return self.fix_valid(now) and bool(self.flags & FLAG_FIX_GOOD)
+        """fix_valid() and it passes the satellites/HDOP gate."""
+        return self.fix_valid(now) and self.good_flag
 
     def motion_valid(self, now):
-        return self.answering(now) and bool(self.flags & FLAG_MOTION_VALID)
+        """sog_kn / cog_deg come from a valid RMC not older than FIX_MAX_AGE_MS."""
+        return self.motion_flag and time.ticks_diff(now, self.motion_stamp) <= FIX_MAX_AGE_MS
 
     def describe(self, now):
         """One-line status for the console."""
-        if not self.answering(now):
-            return "gps: board not answering (i2c errors: %d, crc: %d, version: %d)" % (
-                self.i2c_errors, self.crc_errors, self.version_errors)
-        if not self.flags & FLAG_LINK_OK:
-            return "gps: no link to GNSS module"
-        if not self.flags & FLAG_FIX_VALID:
-            return "gps: no fix (sats=%d)" % self.sats
+        if not self.link_ok(now):
+            return "gps: no data from GNSS module (recoveries: %d, checksum errors: %d)" % (
+                self.recoveries, self.checksum_errors)
+        if not self.fix_valid(now):
+            return "gps: waiting for fix (quality=%d, sats=%d)" % (self.gga_quality, self.gga_sats)
         hdop = "-" if self.hdop is None else "%.2f" % self.hdop
-        line = "gps: lat=%.7f lon=%.7f alt=%.1fm sats=%d hdop=%s age=%dms seq=%d" % (
-            self.lat, self.lon, self.alt_m, self.sats, hdop, self.age_ms, self.seq)
-        if self.flags & FLAG_MOTION_VALID:
+        line = "gps: lat=%s lon=%s alt=%.1fm sats=%d hdop=%s age=%dms seq=%d" % (
+            format_e7(self.lat_e7), format_e7(self.lon_e7), self.alt_m, self.sats, hdop,
+            self.fix_age_ms(now), self.seq)
+        if self.motion_valid(now):
             line += " sog=%.2fkn cog=%.1f" % (self.sog_kn, self.cog_deg)
-        line += " OK" if self.flags & FLAG_FIX_GOOD else " LOW-QUALITY"
+        line += " OK" if self.good_flag else " LOW-QUALITY"
         return line
+
+    def status_dict(self, now):
+        """For telemetry. lat_e7 / lon_e7 are the exact values (degrees * 1e7)."""
+        return {
+            "link_ok": self.link_ok(now),
+            "fix_valid": self.fix_valid(now),
+            "fix_good": self.fix_good(now),
+            "motion_valid": self.motion_valid(now),
+            "lat_e7": self.lat_e7,
+            "lon_e7": self.lon_e7,
+            "alt_m": self.alt_m,
+            "sats": self.sats,
+            "hdop": self.hdop,
+            "fix_quality": self.fix_quality,
+            "sog_kn": self.sog_kn,
+            "cog_deg": self.cog_deg,
+            "age_ms": self.fix_age_ms(now),
+            "seq": self.seq,
+            "sentences": self.sentences,
+            "checksum_errors": self.checksum_errors,
+            "overflows": self.overflows,
+            "recoveries": self.recoveries,
+        }
