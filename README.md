@@ -6,6 +6,10 @@ The intent of this project is to explore capabilities of consumer/hobby grade mo
 
 - [Tug Boat](chassis/tug_boat/index.md)
 
+### Electronics
+
+- [Body Control Unit](electronics/body_control_unit_rpipico_mp/index.md) — driving the ESC and rudder servo; switches between RC and autonomous control, with failsafes
+
 ### Missions
 
 1. [Chassis testing](missions/1_chassis_testing/index.md) — first on-water run: water ingress and power consumption

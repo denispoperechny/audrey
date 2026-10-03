@@ -10,7 +10,7 @@ the same two pins carry the REPL, app output and code uploads.
 - Ports: `ls /dev/cu.usb*` (CH340 = `/dev/cu.usbserial-210`, Pico USB = `/dev/cu.usbmodem2101`)
 
 ## Commands
-    mpremote connect /dev/cu.usbserial-210 cp main.py :main.py   # upload
+    mpremote connect /dev/cu.usbserial-210 cp main.py :main.py   # upload (from this folder)
     mpremote connect /dev/cu.usbserial-210 reset                 # restart the app
     mpremote connect /dev/cu.usbserial-210 repl                  # output / REPL
 
