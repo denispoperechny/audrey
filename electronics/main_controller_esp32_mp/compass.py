@@ -1,16 +1,19 @@
-"""Heading from the BNO08x (BNO080/085/086) over I2C.
+"""Heading from the BNO08x (BNO080/085/086) over a UART (UART-SHTP, 3 Mbaud).
 
-The sensor sits at 0x4B, a BNO08x-family address. This uses the "bno08x" driver vendored
-into this project (bno08x.py -- MIT-licensed, github.com/dobodu/BOSCH-BNO085-I2C-micropython-library,
-itself adapted from Adafruit's CircuitPython BNO08x library).
+This uses the "bno08x" driver vendored into this project (bno08x.py -- MIT-licensed,
+github.com/dobodu/BOSCH-BNO085-I2C-micropython-library, itself adapted from Adafruit's
+CircuitPython BNO08x library), with its I2C transport replaced by a UART one: the chip's
+I2C doesn't work reliably with the ESP32-S3 (see controller.py). The I2C original is kept
+as archive_bno08x.py.
 
-Wiring (BNO08x breakout -> ESP32):
+Wiring (BNO08x breakout -> ESP32; the UART pins are in controller.BOARD_PINS):
   VIN -> 3.3V
   GND -> GND
-  SDA -> GPIO21
-  SCL -> GPIO22
-No reset or interrupt pin wired -- the driver polls over I2C instead, which is slower to
-notice a fresh reading but doesn't need extra wiring.
+  PS1 -> 3.3V, PS0 -> GND (selects UART-SHTP; read by the chip at power-on / reset)
+  SDA -> the UART's RX pin (in this mode it's the chip's TX)
+  SCL -> the UART's TX pin (the chip's RX)
+No reset or interrupt pin wired -- the driver reads whatever the UART has received since
+the last update, and resets the chip with a command.
 
 The Rotation Vector report fuses accel + gyro + magnetometer into an absolute heading, as
 opposed to the driver's default "Game Rotation Vector" (accel + gyro only), which has no
@@ -46,8 +49,10 @@ you turn clockwise. Adjust HEADING_SIGN / HEADING_OFFSET_DEG below if it doesn't
 
 import time
 
+from machine import UART
+
 from bno08x import (BNO08X, BNO_REPORT_MAGNETOMETER, BNO_REPORT_ROTATION_VECTOR, ME_SAVE_DCD_PERIODIC_CDE,
-                    REPORT_ACCURACY_STATUS)
+                    REPORT_ACCURACY_STATUS, UART_BAUDRATE)
 
 ROTATION_VECTOR_HZ = 10  # sensor's internal update rate
 MAGNETOMETER_HZ = 2  # only read for its calibration accuracy, which changes slowly
@@ -66,12 +71,16 @@ SAVE_RETRY_MS = 30000  # a failed save blocks for up to 2 s (driver timeout); do
 
 ACCURACY_HIGH = 3
 
+UART_RX_BUFFER = 2048  # the sensor sends ~300 bytes/s; this rides out a loop stalled for seconds
+
 
 class Compass:
     """Reads the fused heading and keeps the magnetometer calibration saved."""
 
-    def __init__(self, i2c, rate_hz=ROTATION_VECTOR_HZ):
-        self.bno = BNO08X(i2c, debug=False)
+    def __init__(self, uart_id, rx_pin, tx_pin, rate_hz=ROTATION_VECTOR_HZ):
+        # timeout=0: reads return what has arrived and never block
+        uart = UART(uart_id, baudrate=UART_BAUDRATE, rx=rx_pin, tx=tx_pin, rxbuf=UART_RX_BUFFER, timeout=0)
+        self.bno = BNO08X(uart, debug=False)
         self.rate_hz = rate_hz
         self._enable_reports()
         self.bno.set_quaternion_euler_vector(BNO_REPORT_ROTATION_VECTOR)
@@ -104,13 +113,13 @@ class Compass:
 
     def restart_reports(self):
         """Re-enables the reports without resetting the chip, so it keeps its calibration.
-        Takes milliseconds; raises on I2C errors."""
+        Takes milliseconds; raises if the chip doesn't confirm."""
         self.report_restarts += 1
         self._enable_reports()
 
     def update(self, now):
         """Reads the latest heading and accuracy; saves the calibration once it's stable.
-        I2C or driver errors propagate to the caller."""
+        Driver errors propagate to the caller."""
         _roll, _tilt, pan = self.bno.euler  # (roll, tilt, pan); "pan" is yaw/heading, -180..180
         report = self.bno._readings.get(BNO_REPORT_ROTATION_VECTOR)
         if report is not self.last_report:
@@ -121,7 +130,7 @@ class Compass:
 
         # Kept up to date from the Magnetometer reports read along with the heading. (The
         # driver's calibration_status property returns the same value, after sending a
-        # pointless request over I2C.)
+        # pointless request.)
         self.accuracy = self.bno._magnetometer_accuracy  # 0..3
 
         if AUTO_SAVE_AFTER_STABLE_MS is None or self.calibration_saved:

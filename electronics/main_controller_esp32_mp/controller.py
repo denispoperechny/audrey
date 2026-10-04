@@ -8,14 +8,14 @@ so a network stall can't hold up the loop.
 
   task        period   what
   control       50 ms  decide throttle/rudder, send to the body control unit (bcu.py)
-  compass      100 ms  read heading (compass.py)
+  compass      100 ms  read heading (compass.py), print it on the console
   gps          100 ms  read NMEA from the L76K GNSS module on a UART (gps.py)
   bcu_status  1000 ms  read the Pico's status block
   mqtt        1000 ms  handle received commands, queue telemetry
-  report      1000 ms  console line, heartbeat LED, garbage collection
+  report      1000 ms  heartbeat LED, garbage collection
 
-The compass and the Pico share one I2C bus (pins in BOARD_PINS): BNO08x at 0x4B, Pico at
-0x31. The L76K GNSS module has its own UART (pins in BOARD_PINS).
+The Pico is on the I2C bus at 0x31; the BNO08x compass and the L76K GNSS module each have
+their own UART (pins in BOARD_PINS).
 
 Resiliency -- this is an autonomous boat, so no single failure may stop the loop:
   - Every task runs inside its own try/except. An exception is counted, logged (rate-
@@ -66,22 +66,24 @@ from gps import GpsLink
 BOARD_PINS = {
     # Seeed XIAO ESP32-S3: I2C on the header's D4 (GPIO5) / D5 (GPIO6); user LED on GPIO21.
     # D6/D7 (GPIO43/44) are UART0 on the header: the MicroPython console, kept for it.
-    # Software I2C at 50 kHz: the BNO08x compass doesn't work with the S3's hardware I2C
-    # (2026-10-03, Heltec gone, compass freshly power-cycled: it shows up in a scan but
-    # init fails with ENODEV at 100 kHz, then it drops off the bus until power-cycled).
-    # Bit-banged I2C works, with occasional compass read errors; while the compass
-    # misbehaves, the Pico's status reads also fail their checksum more often. The Pico
-    # alone is fine on hardware I2C up to 400 kHz. Fix for later: compass on UART-RVC or
-    # on its own bus.
+    # The BNO08x compass doesn't work on I2C with the S3 (2026-10-03: on hardware I2C, at
+    # 100 and 50 kHz, init fails; bit-banged, reads return garbage every few minutes and the
+    # compass then needs a reset), so it's on UART2 at 3 Mbaud (compass.py):
+    # D1 (GPIO2) = RX <- compass SDA, D0 (GPIO1) = TX -> compass SCL.
+    # The I2C bus is still the software one at 50 kHz it was when the compass shared it,
+    # now with only the Pico on it; the Pico alone was fine on hardware I2C up to 400 kHz.
     # L76K on UART1: D10 (GPIO9) = RX <- module TX, D9 (GPIO8) = TX -> module RX.
     "ESP32_GENERIC_S3": {"name": "XIAO ESP32-S3", "sda": 5, "scl": 6, "led": 21,
                          "soft_i2c": True, "i2c_freq": 50_000,
-                         "gnss_uart": 1, "gnss_rx": 9, "gnss_tx": 8},
+                         "gnss_uart": 1, "gnss_rx": 9, "gnss_tx": 8,
+                         "compass_uart": 2, "compass_rx": 2, "compass_tx": 1},
     # ESP32 WROOM dev board: the default I2C pins; most of these boards put the LED on GPIO2.
-    # L76K on UART2's usual pins (not tried on this board).
+    # L76K on UART2's usual pins, compass on UART1 moved off its default pins, which this
+    # board uses for its flash (neither tried on this board).
     "ESP32_GENERIC": {"name": "ESP32 WROOM", "sda": 21, "scl": 22, "led": 2,
                       "soft_i2c": False, "i2c_freq": 100_000,
-                      "gnss_uart": 2, "gnss_rx": 16, "gnss_tx": 17},
+                      "gnss_uart": 2, "gnss_rx": 16, "gnss_tx": 17,
+                      "compass_uart": 1, "compass_rx": 26, "compass_tx": 25},
 }
 
 
@@ -295,7 +297,7 @@ class Controller:
         try:
             from compass import Compass
 
-            self.compass = Compass(self.i2c)
+            self.compass = Compass(BOARD["compass_uart"], BOARD["compass_rx"], BOARD["compass_tx"])
             self.compass_inits += 1
             print("compass ready (init #%d)" % self.compass_inits)
         except Exception as e:
@@ -327,6 +329,7 @@ class Controller:
         compass = self.compass
         if not self.compass_lost(now):
             compass.update(now)  # errors are counted by the task; staleness decides recovery
+            print("%.1f" % compass.heading)
             if compass.fresh(now, COMPASS_LOST_MS):
                 self.compass_restart_tried = False
             return
@@ -336,7 +339,7 @@ class Controller:
             self.compass_restart_tried = True
             self.compass_attempt = now
             print("compass: no heading for %d ms, re-enabling its reports" % COMPASS_LOST_MS)
-            compass.restart_reports()  # an I2C error here is counted by the task
+            compass.restart_reports()  # an error here is counted by the task
         elif time.ticks_diff(now, self.compass_init_at) >= COMPASS_RETRY_MS:
             self.try_init_compass(now)
 
@@ -359,15 +362,6 @@ class Controller:
     def report(self, now):
         self.led.value(not self.led.value())
         gc.collect()  # at a known moment, instead of whenever an allocation triggers it
-        print(" | ".join((
-            "out thr=%d rud=%d (%s)" % (self.throttle, self.rudder, self.reason),
-            self.describe_compass(now),
-            self.gps.describe(now),
-            self.bcu.describe(),
-            self.mqtt.describe() if self.mqtt is not None else "mqtt: disabled",
-            self.task_errors_summary(),
-            self.describe_memory(),
-        )))
 
     # ---- helpers ---------------------------------------------------------------------
 
@@ -418,8 +412,6 @@ class Controller:
         unstick_i2c_bus()
         self.i2c = make_i2c()
         self.bcu.i2c = self.i2c
-        if self.compass is not None:
-            self.compass.bno._i2c = self.i2c  # the driver keeps its own reference
         self.i2c_fail_streak = 0
 
     def describe_memory(self):

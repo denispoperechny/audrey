@@ -1,10 +1,4 @@
-# BNO08X Micropython Library by Dobodu, with the I2C transport replaced by UART (UART-SHTP)
-#
-# The chip's I2C doesn't work reliably with the ESP32-S3 (see controller.py), so this talks
-# to it over a UART instead: breakout PS1 = 3V3, PS0 = GND, its SDA pin is then its TX and
-# its SCL pin its RX. Only the transport differs from the I2C original, which is kept as
-# archive_bno08x.py: the constructor takes a UART, and _send_packet / _read_packet /
-# _data_ready frame and unframe the same SHTP packets (see "UART-SHTP" below).
+# BNO08X Micropython I2C Library by Dobodu
 #
 # Adapted from original Adafruit CircuitPyhton library
 # SPDX-FileCopyrightText: Copyright (c) 2020 Bryan Siepert for Adafruit Industries
@@ -25,21 +19,13 @@ from math import asin, atan2, degrees
 from collections import namedtuple
 from micropython import const
 from ustruct import unpack_from, pack_into
-from utime import ticks_ms, sleep_ms, sleep_us, ticks_diff
+from utime import ticks_ms, sleep_ms, ticks_diff
 
 LIBNAME = "BNO08X"
 LIBVERSION = "1.0.8"
 
-# UART-SHTP (BNO08x datasheet): 3 Mbaud 8N1. A packet travels as flag, protocol ID, packet
-# bytes, flag; a flag or escape byte inside it is sent as escape, byte ^ UART_ESCAPE_XOR.
-UART_BAUDRATE = 3_000_000
-UART_FLAG = const(0x7E)
-UART_ESCAPE = const(0x7D)
-UART_ESCAPE_XOR = const(0x20)
-UART_PROTOCOL_SHTP = const(0x01)
-UART_BYTE_GAP_US = 200  # the chip needs >= 100 us between the bytes it receives
-UART_FRAME_BUFFER_SIZE = 512  # the largest packet it sends us, the advertisement, is 276 bytes
-RESET_TIMEOUT_MS = 1000  # no packet this long after a reset command = no sensor
+# BNO08X SETUP
+BNO08X_DEFAULT_ADDRESS = (0x4A, 0x4B)
 
 # Buffer Size
 DATA_BUFFER_SIZE = 4096
@@ -513,24 +499,35 @@ class PacketError(Exception):
 class BNO08X:
     # Library for the BNO08x IMUs from Hillcrest Laboratories
 
-    def __init__(self, uart, rst_pin=None, debug=False):
-        # uart: a machine.UART at UART_BAUDRATE with timeout=0 (reads must not block)
+    def __init__(self, i2c, address=None, rst_pin=None, int_pin=None, int_handler=None, debug=False):
 
         self._debug = debug
-        self._uart = uart
+        self._i2c = i2c
         self._rst_pin = rst_pin
         self._ready = False
 
-        # Receive side: bytes are unescaped into _frame until the closing flag; _frame_size
-        # is then the length of the complete frame (protocol ID + packet) waiting to be read.
-        self._frame = bytearray(UART_FRAME_BUFFER_SIZE)
-        self._frame_mv = memoryview(self._frame)
-        self._frame_len = 0
-        self._frame_escape = False
-        self._frame_size = 0
-        self._rx_byte = bytearray(1)
-        self._tx_byte = bytearray(1)
-        self.frame_errors = 0  # frames dropped: truncated, oversized or not a valid packet
+        # Searching for BNO08x addresses on I2C bus if not specified
+        if address is None:
+            devices = set(self._i2c.scan())
+            mpus = devices.intersection(set(BNO08X_DEFAULT_ADDRESS))
+            nb_of_mpus = len(mpus)
+            if nb_of_mpus == 0:
+                raise ValueError("No BNO08x detected")
+            elif nb_of_mpus == 1:
+                self._bno_add = mpus.pop()
+                self._dbg("BNO08x found at address", hex(self._bno_add))
+                self._ready = True
+            else:
+                raise ValueError("Two BNO08x detected: must specify a device address")
+        else:
+            self._bno_add = address
+
+        if int_pin is not None:
+            self.int_pin = int_pin
+            self.int_handler = int_handler
+            self.int_locked = False
+            int_pin.irq(trigger=int_pin.IRQ_FALLING | int_pin.IRQ_RISING,
+                        handler=self.int_handle)
 
         self._dbg("INITIALISATION...")
         self._buffer = bytearray(DATA_BUFFER_SIZE)
@@ -557,7 +554,6 @@ class BNO08X:
         # for saving the most recent reading when decoding several packets
         self._readings = {}
         self.initialize()
-        self._ready = True
 
     def initialize(self):
         # Initialize the sensor
@@ -574,31 +570,30 @@ class BNO08X:
         else:
             raise RuntimeError("Could not initialize")
 
+    def int_handle(self, pin):
+        if not pin.value() and not self.int_locked:
+            self.int_locked = True  # Lock Interrupt
+            buff = "New BNO Message"
+            # if buff is not None:
+            #    self.int_handler(buff)
+        elif pin.value() and self.int_locked:
+            self.int_locked = False  # Unlock interrupt
+
     # Reset the sensor to an initial unconfigured state
     def soft_reset(self):
         self._dbg("SOFT RESETTING...")
-        self._flush_rx()
         data = bytearray(1)
         data[0] = 1
         _seq = self._send_packet(BNO_CHANNEL_EXE, data)
-
-        # The chip answers a reset with its advertisement (channel 0); reports it was still
-        # sending when the command arrived may come first. No advertisement = nothing connected.
-        start_time = ticks_ms()
-        while True:
-            if ticks_diff(ticks_ms(), start_time) >= RESET_TIMEOUT_MS:
-                raise ValueError("No BNO08x detected")
-            if not self._data_ready:
-                sleep_ms(5)
-            elif self._read_packet().channel_number == BNO_CHANNEL_SHTP_COMMAND:
-                break
-        sleep_ms(100)  # the rest of what it sends after a reset follows right away
+        sleep_ms(500)
+        _seq = self._send_packet(BNO_CHANNEL_EXE, data)
+        sleep_ms(500)
 
         for _i in range(3):
             try:
                 _packet = self._read_packet()
             except PacketError:
-                break
+                sleep_ms(500)
         self._dbg("SOFT RESETTING... OK!")
 
     # Hardware reset the sensor to an initial unconfigured state
@@ -648,7 +643,7 @@ class BNO08X:
             self._dbg("Feature IDs", self._readings)
             if feature_id in self._readings:
                 return
-        raise RuntimeError("BNO08X : ENABLING FEATURE ID : Was not able to enable feature", feature_id)
+        raise RuntimeError("BNO08X_I2C : ENABLING FEATURE ID : Was not able to enable feature", feature_id)
 
     def set_orientation(self, quaternion):
         return  # Procedure to be completed and corrected
@@ -1031,7 +1026,7 @@ class BNO08X:
         start_time = ticks_ms()
         while ticks_diff(ticks_ms(), start_time) < timeout:
             if not self._data_ready:
-                sleep_ms(1)
+                print("NOT READY")
                 continue
             new_packet = self._read_packet()
             return new_packet
@@ -1332,9 +1327,18 @@ class BNO08X:
 
     @property
     def _data_ready(self):
-        # A complete packet has arrived on the UART and is waiting for _read_packet
-        ready = self._fill_frame()
-        self._dbg("BNO08X_DATA READY : ", ready)
+        # Check if there is available data on the I2C bus
+        header = self._read_header()
+        if header.channel_number > 5:
+            self._dbg("channel number out of range:", header.channel_number)
+        if header.packet_byte_count == 0x7FFF:
+            print("Byte count is 0x7FFF/0xFFFF; Error?")
+            if header.sequence_number == 0xFF:
+                print("Sequence number is 0xFF; Error?")
+            ready = False
+        else:
+            ready = header.data_length > 0
+        self._dbg("BNO08X_I2C_DATA READY : ", ready)
         return ready
 
     # Send a packet = header + packet data
@@ -1355,40 +1359,39 @@ class BNO08X:
         if self._debug:
             print(packet)
 
-        # Send the packet to the UART as one frame and increase the sequence number
-        self._write_byte(UART_FLAG)
-        self._write_byte(UART_PROTOCOL_SHTP)
-        for idx in range(write_length):
-            send_byte = self._buffer[idx]
-            if send_byte == UART_FLAG or send_byte == UART_ESCAPE:
-                self._write_byte(UART_ESCAPE)
-                send_byte ^= UART_ESCAPE_XOR
-            self._write_byte(send_byte)
-        self._write_byte(UART_FLAG)
+        # Send the packet to the I2C bus and increase the sequence number
+        self._i2c.writeto(self._bno_add, self._buffer[0:write_length])
         self._seq_nb[channel] = (self._seq_nb[channel] + 1) % 256
 
         return self._seq_nb[channel]
-
-    def _write_byte(self, value):
-        self._tx_byte[0] = value
-        self._uart.write(self._tx_byte)
-        sleep_us(UART_BYTE_GAP_US)
 
     # Read a packet = header + packet data
     def _read_packet(self):
 
         self._dbg("READING PACKET...")
 
-        if not self._fill_frame():
-            self._dbg("\tSKIPPING NO PACKETS AVAILABLE IN bno08x._read_packet")
+        # Header is 4 bytes long (2 bytes size, 1 byte for channel number and 1 byte for sequence number)
+        # Buffer is declared in BNO08X class : self._buffer = bytearray(512)
+        # But here we use the memory image from this buffer which is declared in BNO08X class
+        # I2C address is declared in class : self._bno_add
+
+        # Begin with reading a header ==> Expecting a header (4 bytes)
+        self._i2c.readfrom_into(self._bno_add, self._buffer_mv[0:4])
+
+        # Decode the  and update sequence number
+        header = Packet.header_from_buffer(self._buffer[0:4])
+        packet_byte_count = header.packet_byte_count
+        channel_number = header.channel_number
+        sequence_number = header.sequence_number
+        data_length = header.data_length
+        self._seq_nb[channel_number] = sequence_number
+
+        if packet_byte_count == 0:
+            self._dbg("\tSKIPPING NO PACKETS AVAILABLE IN bno08x_i2c._read_packet")
             raise PacketError("No packet available")
 
-        # Header is 4 bytes long (2 bytes size, 1 byte for channel number and 1 byte for sequence number)
-        # The frame holds the protocol ID, then the packet; the packet goes to self._buffer,
-        # where the rest of the driver expects the last packet read
-        packet_byte_count = self._frame_size - 1
-        self._buffer_mv[0:packet_byte_count] = self._frame_mv[1:self._frame_size]
-        self._frame_size = 0
+        # Then we read the packet data to the buffer image
+        self._i2c.readfrom_into(self._bno_add, self._buffer_mv[0:packet_byte_count])
 
         # Then process the packet
         new_packet = Packet(self._buffer[0:packet_byte_count])
@@ -1397,53 +1400,20 @@ class BNO08X:
         self._update_sequence_number(new_packet)
         return new_packet
 
-    def _fill_frame(self):
-        # Moves received bytes into the frame buffer, up to the end of one frame. True when a
-        # complete, valid packet is waiting. Never blocks: the UART has timeout=0.
-        if self._frame_size:
-            return True
-        uart = self._uart
-        rx_byte = self._rx_byte
-        frame = self._frame
-        while uart.readinto(rx_byte):
-            value = rx_byte[0]
-            if value == UART_FLAG:
-                length = self._frame_len
-                self._frame_len = 0
-                self._frame_escape = False
-                if length == 0:
-                    continue  # opening flag, or the next frame's right after a closing one
-                if self._frame_valid(length):
-                    self._frame_size = length
-                    return True
-                self.frame_errors += 1
-                continue
-            if value == UART_ESCAPE:
-                self._frame_escape = True
-                continue
-            if self._frame_escape:
-                self._frame_escape = False
-                value ^= UART_ESCAPE_XOR
-            if self._frame_len < UART_FRAME_BUFFER_SIZE:
-                frame[self._frame_len] = value
-            self._frame_len += 1  # an oversized frame keeps counting, and fails _frame_valid
-        return False
+    def _read_header(self):
 
-    def _frame_valid(self, length):
-        # protocol ID + a packet whose header agrees with what was received: its length, a
-        # known channel and at least one byte of data
-        if length < 6 or length > UART_FRAME_BUFFER_SIZE or self._frame[0] != UART_PROTOCOL_SHTP:
-            return False
-        packet_byte_count, channel_number = unpack_from("<HB", self._frame, 1)
-        return packet_byte_count & 0x7FFF == length - 1 and channel_number <= 5
+        # Read only a packet Header
+        self._dbg("READING HEADER...")
 
-    def _flush_rx(self):
-        # Drops everything received so far
-        while self._uart.read():
-            pass
-        self._frame_len = 0
-        self._frame_escape = False
-        self._frame_size = 0
+        # Reads the first 4 bytes available as a header ==> Expecting a header
+        self._i2c.readfrom_into(self._bno_add, self._buffer_mv[0:4])
+        packet_header = Packet.header_from_buffer(self._buffer[0:4])
+        header = Header(self._buffer[0:4])
+
+        if self._debug:
+            print(header)
+
+        return packet_header
 
     def _insert_cde_request_report(self, command, buffer, next_sequence_number, command_params=None):
         if command_params and len(command_params) > 9:
