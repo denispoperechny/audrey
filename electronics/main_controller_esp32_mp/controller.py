@@ -70,11 +70,11 @@ BOARD_PINS = {
     # 100 and 50 kHz, init fails; bit-banged, reads return garbage every few minutes and the
     # compass then needs a reset), so it's on UART2 at 3 Mbaud (compass.py):
     # D1 (GPIO2) = RX <- compass SDA, D0 (GPIO1) = TX -> compass SCL.
-    # The I2C bus is still the software one at 50 kHz it was when the compass shared it,
-    # now with only the Pico on it; the Pico alone was fine on hardware I2C up to 400 kHz.
+    # With the compass gone from it, the I2C bus (now only the Pico) is back on the hardware
+    # peripheral at 100 kHz.
     # L76K on UART1: D10 (GPIO9) = RX <- module TX, D9 (GPIO8) = TX -> module RX.
     "ESP32_GENERIC_S3": {"name": "XIAO ESP32-S3", "sda": 5, "scl": 6, "led": 21,
-                         "soft_i2c": True, "i2c_freq": 50_000,
+                         "soft_i2c": False, "i2c_freq": 100_000,
                          "gnss_uart": 1, "gnss_rx": 9, "gnss_tx": 8,
                          "compass_uart": 2, "compass_rx": 2, "compass_tx": 1},
     # ESP32 WROOM dev board: the default I2C pins; most of these boards put the LED on GPIO2.
