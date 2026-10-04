@@ -25,7 +25,9 @@ Resiliency -- this is an autonomous boat, so no single failure may stop the loop
   - Nothing is used without being fresh: the heading has to be newer than
     COMPASS_MAX_AGE_MS and the GPS fix has to be valid (gps.py), or control holds neutral.
     The Pico independently goes neutral if our commands stop for 750 ms.
-  - A missing or dead compass is retried every COMPASS_RETRY_MS instead of failing boot.
+  - A compass that stops sending gets its reports re-enabled first (no reset, so it keeps
+    its calibration); only if that doesn't help is it re-initialized, at most every
+    COMPASS_RETRY_MS. A missing compass doesn't fail boot.
   - If I2C writes to the Pico keep failing, the bus is recovered (9 SCL pulses + STOP to
     free a target stuck holding SDA, then the peripheral is re-created), at most every
     I2C_RECOVERY_INTERVAL_MS, backing off to I2C_RECOVERY_MAX_INTERVAL_MS while it doesn't
@@ -111,8 +113,9 @@ REPORT_PERIOD_MS = 1000
 
 # ---- Health / recovery ----
 COMPASS_MAX_AGE_MS = 500  # a heading older than this isn't used for control
-COMPASS_LOST_MS = 3000  # no new heading for this long = re-initialize the sensor
-COMPASS_RETRY_MS = 10000  # at most this often (init blocks for ~1 s)
+COMPASS_LOST_MS = 3000  # no new heading for this long: re-enable its reports (no reset, ms);
+# still none COMPASS_LOST_MS later: re-initialize it, which resets the chip (~1.5 s blocking)
+COMPASS_RETRY_MS = 10000  # re-initialize at most this often
 I2C_RECOVERY_AFTER_FAILS = 20  # consecutive failed writes to the Pico (1 s at 20 Hz)
 I2C_RECOVERY_INTERVAL_MS = 5000  # doubles after each recovery that didn't help...
 I2C_RECOVERY_MAX_INTERVAL_MS = 60000  # ...up to this; back to the start on a good write
@@ -239,8 +242,10 @@ class Controller:
 
         self.gps = GpsLink(BOARD["gnss_uart"], BOARD["gnss_rx"], BOARD["gnss_tx"], time.ticks_ms())
         self.compass = None
-        self.compass_attempt = None
+        self.compass_attempt = None  # last init or report restart
+        self.compass_init_at = None  # last init
         self.compass_inits = 0
+        self.compass_restart_tried = False  # reports re-enabled since the last heading
         self.try_init_compass(time.ticks_ms())
 
         self.i2c_fail_streak = 0
@@ -284,7 +289,9 @@ class Controller:
         """(Re)creates the compass. Blocks ~1 s when the sensor is there; fails fast when
         it isn't. Failures are reported and retried later, never raised."""
         self.compass_attempt = now
+        self.compass_init_at = now
         self.compass = None
+        self.compass_restart_tried = False
         try:
             from compass import Compass
 
@@ -317,9 +324,20 @@ class Controller:
         return 0, 0, "idle"
 
     def read_compass(self, now):
+        compass = self.compass
         if not self.compass_lost(now):
-            self.compass.update(now)  # errors are counted by the task; staleness decides re-init
-        elif time.ticks_diff(now, self.compass_attempt) >= COMPASS_RETRY_MS:
+            compass.update(now)  # errors are counted by the task; staleness decides recovery
+            if compass.fresh(now, COMPASS_LOST_MS):
+                self.compass_restart_tried = False
+            return
+        if compass is not None and not self.compass_restart_tried:
+            # Cheap first: re-enable the reports. Re-initializing would reset the chip, which
+            # drops the calibration it learned since its last save and blocks for ~1.5 s.
+            self.compass_restart_tried = True
+            self.compass_attempt = now
+            print("compass: no heading for %d ms, re-enabling its reports" % COMPASS_LOST_MS)
+            compass.restart_reports()  # an I2C error here is counted by the task
+        elif time.ticks_diff(now, self.compass_init_at) >= COMPASS_RETRY_MS:
             self.try_init_compass(now)
 
     def read_gps(self, now):
@@ -354,13 +372,14 @@ class Controller:
     # ---- helpers ---------------------------------------------------------------------
 
     def compass_lost(self, now):
-        """No sensor, or no new heading for COMPASS_LOST_MS (counting from the init if it
-        never sent one)."""
+        """No sensor, or no new heading for COMPASS_LOST_MS, counting from the last init or
+        report restart if that's more recent."""
         compass = self.compass
         if compass is None:
             return True
-        last = compass.stamp if compass.seen else self.compass_attempt
-        return time.ticks_diff(now, last) > COMPASS_LOST_MS
+        if time.ticks_diff(now, self.compass_attempt) <= COMPASS_LOST_MS:
+            return False  # give a fresh init or report restart its full window
+        return not compass.seen or time.ticks_diff(now, compass.stamp) > COMPASS_LOST_MS
 
     def describe_compass(self, now):
         if self.compass is None:
@@ -424,6 +443,10 @@ class Controller:
                 "accuracy": compass.accuracy,
                 "fresh": compass.fresh(now, COMPASS_MAX_AGE_MS),
                 "inits": self.compass_inits,
+                "report_restarts": compass.report_restarts,
+                "calibration_saved": compass.calibration_saved,
+                "saves": compass.saves,
+                "save_failures": compass.save_failures,
             },
             "gps": self.gps.status_dict(now),
             "bcu": self.bcu.status_dict(),
