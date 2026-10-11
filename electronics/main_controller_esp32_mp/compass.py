@@ -39,12 +39,11 @@ on at init (SH-2 "Configure Periodic DCD Save"). Initializing resets the chip (t
 soft reset), so the controller avoids it: when headings stop, it first tries
 restart_reports(), which re-enables the reports without a reset.
 
-NOTE ON HEADING CONVENTION: the driver derives heading from a standard yaw formula; whether
-0 degrees corresponds to magnetic north, and whether it increases clockwise (as a compass
-does) or counterclockwise (as most math yaw does), depends on the chip's physical mounting
-orientation and hasn't been verified against a real compass yet. Check it once running:
-point the board at a known heading and confirm the printed number matches and increases as
-you turn clockwise. Adjust HEADING_SIGN / HEADING_OFFSET_DEG below if it doesn't.
+NOTE ON HEADING CONVENTION: the driver derives heading from a standard yaw formula, which
+increases counterclockwise (the math convention) and has its zero wherever the chip's axes
+put it. HEADING_SIGN and HEADING_OFFSET_DEG below turn it into a compass heading: 0 = bow
+at magnetic north, increasing clockwise. Both were checked on the boat; recheck them after
+remounting the sensor: bow north should read 0 (or 360), and a quarter turn to the right 90.
 """
 
 import time
@@ -57,8 +56,9 @@ from bno08x import (BNO08X, BNO_REPORT_MAGNETOMETER, BNO_REPORT_ROTATION_VECTOR,
 ROTATION_VECTOR_HZ = 10  # sensor's internal update rate
 MAGNETOMETER_HZ = 2  # only read for its calibration accuracy, which changes slowly
 
-# Adjust these once you've checked the heading against a real compass (see note above).
-HEADING_SIGN = 1  # set to -1 if heading increases counterclockwise instead of clockwise
+# The chip's yaw increases counterclockwise: -1 makes the heading increase clockwise.
+# (Checked 2026-10-11: with +1, bow north read 360 and a quarter turn left read 90.)
+HEADING_SIGN = -1
 # Mounting: the chip reads 0 when the board's Y+ arrow points at magnetic north (checked
 # 2026-10-03). The board is mounted with Y+ toward the stern, so 180 makes 0 = bow north.
 HEADING_OFFSET_DEG = 180.0

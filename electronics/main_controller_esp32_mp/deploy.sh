@@ -13,7 +13,7 @@
 set -e
 cd "$(dirname "$0")"
 
-MODULES="bno08x compass gps bcu mqtt controller"
+MODULES="bno08x compass gps gnc bcu mqtt controller"
 PORT="${1:-$(ls /dev/cu.usbserial-* /dev/cu.usbmodem* 2>/dev/null | head -1)}"
 MPY_CROSS="${MPY_CROSS:-mpy-cross}"
 

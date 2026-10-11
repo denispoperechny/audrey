@@ -33,6 +33,8 @@ Resiliency -- this is an autonomous boat, so no single failure may stop the loop
     I2C_RECOVERY_INTERVAL_MS, backing off to I2C_RECOVERY_MAX_INTERVAL_MS while it doesn't
     help (e.g. the Pico is simply unplugged).
   - Missing config.py or a failing network start only disables MQTT.
+  - An error in the navigation code is contained like any other task error: no command
+    goes out that pass, and the Pico goes neutral by itself if that lasts.
   - Production mode (a file named "production" on the board) starts a hardware watchdog
     that resets the chip if the loop stops for WDT_MS. It can't be stopped once running,
     so the board first holds neutral for BOOT_WINDOW_MS, when Ctrl+C still gets through:
@@ -41,8 +43,18 @@ Resiliency -- this is an autonomous boat, so no single failure may stop the loop
   - Anything that escapes all of the above (a bug in the loop itself) is caught in
     main.py, which prints the error, commands neutral and resets the chip.
 
-Navigation isn't wired in yet (see gnc.py): control() always commands neutral, but the
-structure -- health checks first, then a decision with a reason -- is where it goes.
+Commands arrive over MQTT as JSON objects (topic in mqtt.py); the last one is echoed in
+telemetry. Those with a "cmd" the controller knows are acted on:
+  {"cmd": "destination", "lat_e7": <int>, "lon_e7": <int>}   where to go, degrees * 1e7 as
+                                                             in telemetry (floats here are
+                                                             too coarse for a position)
+  {"cmd": "clear_destination"}                               forget it
+The destination isn't kept across a restart.
+
+Navigation: once the heading and the GPS fix are good and there is a destination, control()
+asks gnc.py for throttle and rudder, handing it the destination, the latest fix, motion and
+heading with their timestamps (gnc.NavInputs). What gnc.py based its answer on (distance,
+course to steer, course error) goes out in telemetry as "nav".
 """
 
 import gc
@@ -55,6 +67,7 @@ import esp32
 import machine
 from machine import I2C, Pin, SoftI2C
 
+import gnc
 from bcu import BodyControlUnit
 from gps import GpsLink
 
@@ -260,6 +273,9 @@ class Controller:
         self.rudder = 0
         self.reason = "boot"
 
+        self.destination = None  # (lat_e7, lon_e7) from the last "destination" command
+        self.nav = gnc.NavInputs()  # reused every pass
+        self.navigating = False  # the latest control decision came from gnc
         self.last_command = None  # last parsed MQTT command (dict)
         self.last_command_ms = None
         self.bad_commands = 0
@@ -318,12 +334,41 @@ class Controller:
     def decide(self, now):
         """Returns (throttle %, rudder %, reason). Health checks first: anything we can't
         trust means neutral."""
+        self.navigating = False
         if not self.heading_ok(now):
             return 0, 0, "hold: no heading"
         if not self.gps.fix_valid(now):
             return 0, 0, "hold: no gps fix"
-        # Navigation goes here (gnc.py) once it's wired in.
-        return 0, 0, "idle"
+        if self.destination is None:
+            return 0, 0, "idle: no destination"
+        gnc.move_to_destination(self.nav_inputs(now))
+        self.navigating = True
+        throttle, rudder = gnc.controls
+        return throttle, rudder, gnc.state
+
+    def nav_inputs(self, now):
+        nav = self.nav
+        gps = self.gps
+        compass = self.compass
+        nav.now = now
+        nav.dest_lat_e7, nav.dest_lon_e7 = self.destination
+        nav.dest_lat = nav.dest_lat_e7 / 1e7
+        nav.dest_lon = nav.dest_lon_e7 / 1e7
+        nav.lat_e7 = gps.lat_e7
+        nav.lon_e7 = gps.lon_e7
+        nav.lat = gps.lat
+        nav.lon = gps.lon
+        nav.fix_ms = gps.fix_stamp
+        nav.sats = gps.sats
+        nav.hdop = gps.hdop
+        nav.motion_valid = gps.motion_valid(now)
+        nav.sog_kn = gps.sog_kn
+        nav.cog_deg = gps.cog_deg
+        nav.motion_ms = gps.motion_stamp
+        nav.heading = compass.heading
+        nav.heading_ms = compass.stamp
+        nav.heading_accuracy = compass.accuracy
+        return nav
 
     def read_compass(self, now):
         compass = self.compass
@@ -385,8 +430,7 @@ class Controller:
         return self.compass is not None and self.compass.fresh(now, COMPASS_MAX_AGE_MS)
 
     def handle_command(self, payload, received_ms):
-        """Parses and records a command. Commands don't drive the outputs yet -- that's
-        a deliberate next step, not an accidental one."""
+        """Parses, records and applies a command (see the list at the top of this file)."""
         try:
             command = json.loads(payload)
             if not isinstance(command, dict):
@@ -398,6 +442,22 @@ class Controller:
         self.last_command = command
         self.last_command_ms = received_ms
         print("mqtt command: %r" % (command,))
+        name = command.get("cmd")
+        if name == "destination":
+            self.set_destination(command)
+        elif name == "clear_destination":
+            self.destination = None
+
+    def set_destination(self, command):
+        lat_e7 = command.get("lat_e7")
+        lon_e7 = command.get("lon_e7")
+        # type() rather than isinstance(): True and False are ints too
+        if (type(lat_e7) is not int or type(lon_e7) is not int
+                or abs(lat_e7) > 900_000_000 or abs(lon_e7) > 1_800_000_000):
+            self.bad_commands += 1
+            print("mqtt destination rejected: %r" % (command,))
+            return
+        self.destination = (lat_e7, lon_e7)
 
     def recover_i2c(self, now):
         if self.last_i2c_recovery is not None:
@@ -448,6 +508,14 @@ class Controller:
                 "status_checksum": self.bcu.status_checksum_errors,
             },
             "i2c_recoveries": self.i2c_recoveries,
+            "destination": None if self.destination is None else {
+                "lat_e7": self.destination[0], "lon_e7": self.destination[1]},
+            "nav": None if not self.navigating else {
+                "state": gnc.state,
+                "distance_m": round(gnc.distance_m, 1),
+                "target_course_deg": round(gnc.target_course_deg, 1),
+                "course_error_deg": round(gnc.course_error_deg, 1),
+            },
             "last_command": self.last_command,
             "bad_commands": self.bad_commands,
             "tasks": {t.name: t.stats() for t in self.tasks},
