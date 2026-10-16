@@ -1,0 +1,4 @@
+# Logs hold the boat's real GPS positions: kept out of the repo, like the mission 2 serial log.
+*.jsonl
+# ...except copies with the positions and absolute times removed.
+!public_*.jsonl

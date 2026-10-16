@@ -87,6 +87,8 @@ class MqttLink:
         self.wlan = network.WLAN(network.STA_IF)
         self.wifi_connected = False
         self.mqtt_connected = False
+        self.wifi_connects = 0  # times the WiFi link came up, the first included
+        self.mqtt_connects = 0  # same for the broker connection
         self.rx_count = 0
         self.tx_count = 0
         self.errors = 0
@@ -116,6 +118,27 @@ class MqttLink:
             self.rx_count, self.tx_count, self.errors,
             self.commands.dropped, self.telemetry.dropped)
 
+    def status_dict(self):
+        """For telemetry; the counts are since boot. tx is the messages sent before the one
+        this goes into; a telemetry message that didn't arrive was either never sent
+        (dropped_telemetry: the queue was full while the link was down) or lost on the way."""
+        rssi = None
+        if self.wifi_connected:
+            try:
+                rssi = self.wlan.status("rssi")  # dBm
+            except Exception:
+                pass
+        return {
+            "tx": self.tx_count,
+            "rx": self.rx_count,
+            "errors": self.errors,
+            "dropped_telemetry": self.telemetry.dropped,
+            "dropped_commands": self.commands.dropped,
+            "wifi_connects": self.wifi_connects,
+            "mqtt_connects": self.mqtt_connects,
+            "rssi": rssi,
+        }
+
     # --- WiFi thread ------------------------------------------------------------------
 
     def _wifi_connect(self):
@@ -123,6 +146,12 @@ class MqttLink:
         wlan = self.wlan
         if wlan.isconnected():
             return True
+        # End whatever attempt is still running (ours that timed out, or the driver's own
+        # after a dropped link): connect() raises "sta is connecting" while there is one.
+        try:
+            wlan.disconnect()
+        except OSError:
+            pass
         wlan.connect(self.config["wifi_ssid"], self.config["wifi_password"])
         start = time.ticks_ms()
         while not wlan.isconnected():
@@ -144,6 +173,7 @@ class MqttLink:
                 self.wifi_connected = connected
                 print("wifi %s" % ("connected " + self.wlan.ifconfig()[0] if connected else "disconnected"))
                 if connected:
+                    self.wifi_connects += 1
                     # The board's clock starts at year 2000 on every boot, which is before
                     # our TLS cert's validity start; sync it or certificate checks fail.
                     try:
@@ -216,6 +246,7 @@ class MqttLink:
                         continue
                     client = self._connect()
                     self.mqtt_connected = True
+                    self.mqtt_connects += 1
                     print("mqtt connected to %s:%d as %s" % (
                         self.config["mqtt_host"], self.config["mqtt_port"], self.client_id))
 

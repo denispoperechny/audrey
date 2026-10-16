@@ -276,6 +276,7 @@ class Controller:
         self.destination = None  # (lat_e7, lon_e7) from the last "destination" command
         self.nav = gnc.NavInputs()  # reused every pass
         self.navigating = False  # the latest control decision came from gnc
+        self.telemetry_seq = 0  # numbers the telemetry messages, so a lost one shows
         self.last_command = None  # last parsed MQTT command (dict)
         self.last_command_ms = None
         self.bad_commands = 0
@@ -485,8 +486,11 @@ class Controller:
 
     def telemetry(self, now):
         compass = self.compass
+        self.telemetry_seq += 1
         return {
+            "seq": self.telemetry_seq,
             "uptime_s": time.ticks_diff(now, self.boot_ms) // 1000,
+            "link": self.mqtt.status_dict(),
             "reset_cause": self.reset_cause,
             "memory": memory_stats(),
             "output": {"throttle": self.throttle, "rudder": self.rudder, "reason": self.reason},
