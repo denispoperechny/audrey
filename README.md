@@ -9,6 +9,7 @@ The intent of this project is to explore capabilities of consumer/hobby grade mo
 ### Electronics
 
 - [Body Control Unit](electronics/body_control_unit_rpipico_mp/index.md) — driving the ESC and rudder servo; switches between RC and autonomous control, with failsafes
+- [Main / Navigation Unit](electronics/main_controller_esp32_mp/index.md) — the autopilot: reads GPS and compass, takes a destination from the shore, decides throttle and rudder
 
 ### Missions
 
