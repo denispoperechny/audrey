@@ -9,13 +9,14 @@ recent valid GPS fixes.
 Commands go to COMMAND_TOPIC as JSON objects; the ones the boat acts on are listed at the
 top of its controller.py.
 
-Broker settings come from .streamlit/secrets.toml ([mqtt] section, see
-secrets.toml.example) if present, otherwise from the boat's own config.py, so the
-credentials live in one place. Both are gitignored.
+Broker settings come from environment variables (see load_mqtt_config), read from the
+.env file next to this one if there is one: copy .env.example to .env and fill it in. .env
+is gitignored. Variables already set in the environment win over the file, so a container
+can also be given them directly.
 """
 
 import json
-import runpy
+import os
 import threading
 import time
 import uuid
@@ -24,32 +25,32 @@ from pathlib import Path
 
 import paho.mqtt.client as mqtt
 import streamlit as st
+from dotenv import load_dotenv
 
 TELEMETRY_TOPIC = "audrey/boat1/telemetry"  # MQTT_TELEMETRY_TOPIC in the boat's mqtt.py
 COMMAND_TOPIC = "audrey/boat1/cmd"  # MQTT_COMMAND_TOPIC in the boat's mqtt.py
 TRACK_LEN = 3600  # GPS fixes kept for the track (1 per second -> an hour)
 
-CONTROLLER_DIR = Path(__file__).resolve().parents[2] / "electronics" / "main_controller_esp32_mp"
+APP_DIR = Path(__file__).resolve().parent
+ENV_FILE = APP_DIR / ".env"
+MQTT_SETTINGS = ("MQTT_HOST", "MQTT_PORT", "MQTT_USER", "MQTT_PASSWORD", "MQTT_CA_FILE")
 
 
-def load_mqtt_config(secrets=None):
-    """{"host", "port", "user", "password", "ca_file"} from Streamlit secrets or the boat's config.py."""
-    if secrets is not None:
-        try:
-            if "mqtt" in secrets:
-                c = secrets["mqtt"]
-                ca_file = Path(c.get("ca_file", CONTROLLER_DIR / "mqtt_ca.pem"))
-                return {"host": c["host"], "port": int(c["port"]), "user": c["user"],
-                        "password": c["password"], "ca_file": str(ca_file)}
-        except FileNotFoundError:  # no secrets.toml at all
-            pass
-    config = runpy.run_path(str(CONTROLLER_DIR / "config.py"))["config"]
+def load_mqtt_config():
+    """{"host", "port", "user", "password", "ca_file"} from MQTT_HOST, MQTT_PORT, MQTT_USER,
+    MQTT_PASSWORD and MQTT_CA_FILE (the broker's certificate; a relative path is relative to
+    this folder)."""
+    load_dotenv(ENV_FILE)  # doesn't override variables that are already set
+    missing = [name for name in MQTT_SETTINGS if not os.environ.get(name)]
+    if missing:
+        raise RuntimeError("MQTT settings missing: %s. Copy .env.example to .env and fill it in." % ", ".join(missing))
+    ca_file = Path(os.environ["MQTT_CA_FILE"])
     return {
-        "host": config["mqtt_host"],
-        "port": int(config["mqtt_port"]),
-        "user": config["mqtt_user"],
-        "password": config["mqtt_password"],
-        "ca_file": str(CONTROLLER_DIR / config["mqtt_ca_file"]),
+        "host": os.environ["MQTT_HOST"],
+        "port": int(os.environ["MQTT_PORT"]),
+        "user": os.environ["MQTT_USER"],
+        "password": os.environ["MQTT_PASSWORD"],
+        "ca_file": str(ca_file if ca_file.is_absolute() else APP_DIR / ca_file),
     }
 
 
@@ -152,4 +153,4 @@ class TelemetryFeed:
 @st.cache_resource
 def get_feed():
     """One MQTT connection per server process, shared by all pages and browser sessions."""
-    return TelemetryFeed(load_mqtt_config(st.secrets))
+    return TelemetryFeed(load_mqtt_config())

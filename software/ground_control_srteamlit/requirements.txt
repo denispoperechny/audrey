@@ -1,3 +1,4 @@
 streamlit>=1.37
 paho-mqtt>=2.0
 pydeck>=0.9
+python-dotenv>=1.0

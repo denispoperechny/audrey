@@ -1,7 +1,10 @@
 """Audrey ground control: live battery, compass and position of the boat, from MQTT.
 
+    cp .env.example .env             # then fill in the broker settings
     pip install -r requirements.txt
     streamlit run main.py
+
+    docker compose up --build -d     # or as a container, on http://localhost:8501
 
 Telemetry arrives once a second (see telemetry.py); the page refreshes itself every
 REFRESH_S. Broker settings: see telemetry.load_mqtt_config(). The destination is set on

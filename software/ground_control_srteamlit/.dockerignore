@@ -1,0 +1,11 @@
+# Kept out of the image. .env is deliberately NOT listed: the image carries it.
+.venv/
+__pycache__/
+**/__pycache__/
+saved_positions.json
+saved_positions.tmp
+data/
+Dockerfile
+docker-compose.yml
+.dockerignore
+.gitignore

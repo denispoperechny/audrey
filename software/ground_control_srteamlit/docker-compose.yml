@@ -1,0 +1,14 @@
+# docker compose up --build -d     ->  http://localhost:8501 (and this computer's address on the network)
+# docker compose down              stops it; the saved positions stay on the volume
+services:
+  ground-control:
+    build: .
+    image: audrey-ground-control
+    ports:
+      - "8501:8501"
+    volumes:
+      - positions:/app/data
+    restart: unless-stopped
+
+volumes:
+  positions:
