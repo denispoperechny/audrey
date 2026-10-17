@@ -1,0 +1,7 @@
+# Kept out of the image. .env is deliberately NOT listed: the image carries it.
+.venv/
+__pycache__/
+out/
+Dockerfile
+.dockerignore
+.gitignore
