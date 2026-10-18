@@ -1,4 +1,4 @@
-"""MQTT logger: records everything on the boat's MQTT topics into a storage account.
+"""MQTT logger: records MQTT streams (the boat's topics, the GPS reference) into a storage account.
 
     cp .env.example .env             # then fill in the broker settings
     pip install -r requirements.txt
@@ -6,11 +6,17 @@
 
 Runs in the background, as a container app in Azure (see Dockerfile). Every message is
 filed under the 10-minute window it arrived in (UTC, aligned to the clock: 10:00, 10:10,
-...). When a window closes, its messages are uploaded as one JSON Lines file:
+...). When a window closes, each stream's messages are uploaded as one JSON Lines file,
+in that stream's own folder:
 
-    <container>/<prefix>/YYYY/MM/DD/mqtt_YYYYMMDDTHHMMZ.jsonl      (the window's start)
+    <container>/<stream>/YYYY/MM/DD/<stream>_YYYYMMDDTHHMMZ.jsonl      (the window's start)
 
-A window with no messages writes nothing. One line per message, in the same format as
+A stream is a name and the MQTT topics it covers (MQTT_STREAMS). With the defaults:
+
+    mqtt            audrey/boat1/#            the boat: telemetry and the commands sent to it
+    gps-reference   audrey/gps-reference/#    the GPS reference
+
+A stream with no messages in a window writes nothing for it. One line per message, in the same format as
 missions/3_control_test/src/mqtt_logger.py:
 
     {"t": "2026-10-17T15:42:07.123+00:00", "unix": 1792..., "topic": "audrey/boat1/telemetry", "data": {...}}
@@ -27,21 +33,36 @@ Settings come from environment variables, read from the .env file next to this o
 there is one (variables already set win):
 
     MQTT_HOST, MQTT_PORT, MQTT_USER, MQTT_PASSWORD, MQTT_CA_FILE   the broker, as in ground control
-    MQTT_TOPICS            what to record, comma-separated (default audrey/boat1/#)
+    MQTT_STREAMS           what to record: name=topic filter pairs, comma-separated; a name
+                           can be given several filters (default as above). The name is the
+                           folder and the start of the file names. A message goes to the
+                           first stream whose filter matches.
     STORAGE_ACCOUNT_URL    e.g. https://audreylogs.blob.core.windows.net
     STORAGE_CONTAINER      default logs
-    STORAGE_PREFIX         folder inside the container, default mqtt
     WINDOW_S               window length in seconds, default 600
     LOCAL_OUTPUT_DIR       write the files to this folder instead of the storage account
 
 The storage account is reached with DefaultAzureCredential: the container app's managed
 identity in Azure (it needs "Storage Blob Data Contributor"), your az login locally.
+
+Meant to run unattended:
+  - Broker connection drops are reconnected by paho, with back-off up to 30 s, and the
+    subscriptions are renewed on every reconnect. (Messages sent while it is disconnected
+    are not recorded: the boat publishes without delivery guarantees.)
+  - A message that can't be processed is logged and skipped; it can't stop the recording.
+  - Self-check: every HEARTBEAT_S it publishes a heartbeat to its own topic and listens
+    for it. If none has come back for HEARTBEAT_TIMEOUT_S (the broker gone, a stuck
+    connection, a dead network thread), it uploads what it has and exits with an error,
+    and the container platform starts it again from scratch.
+  - Storage errors keep the data in memory and retry (see above); memory is bounded by
+    MAX_PENDING_WINDOWS.
 """
 
 import json
 import logging
 import os
 import signal
+import sys
 import threading
 import time
 import uuid
@@ -52,8 +73,12 @@ import paho.mqtt.client as mqtt
 from dotenv import load_dotenv
 
 APP_DIR = Path(__file__).resolve().parent
-MAX_PENDING_WINDOWS = 144  # windows kept while uploads fail: a day's worth
+MAX_PENDING_WINDOWS = 72  # per stream, kept while uploads fail: 12 hours, ~100 MB of boat telemetry
+DEFAULT_STREAMS = "mqtt=audrey/boat1/#,gps-reference=audrey/gps-reference/#"
 FLUSH_DELAY_S = 5  # flush this long after a window closes, so late arrivals still make it
+HEARTBEAT_S = int(os.environ.get("HEARTBEAT_S", "60"))
+HEARTBEAT_TIMEOUT_S = int(os.environ.get("HEARTBEAT_TIMEOUT_S", "600"))  # no heartbeat back for this long: restart
+HEARTBEAT_TOPIC = "audrey/logger/heartbeat/"  # + the client id; outside the recorded topics
 
 log = logging.getLogger("mqtt_logger")
 
@@ -73,18 +98,29 @@ def settings():
         "user": env["MQTT_USER"],
         "password": env["MQTT_PASSWORD"],
         "ca_file": str(ca_file if ca_file.is_absolute() else APP_DIR / ca_file),
-        "topics": [t.strip() for t in env.get("MQTT_TOPICS", "audrey/boat1/#").split(",") if t.strip()],
+        "streams": parse_streams(env.get("MQTT_STREAMS") or DEFAULT_STREAMS),
         "account_url": env.get("STORAGE_ACCOUNT_URL", ""),
         "container": env.get("STORAGE_CONTAINER", "logs"),
-        "prefix": env.get("STORAGE_PREFIX", "mqtt").strip("/"),
         "window_s": int(env.get("WINDOW_S", "600")),
         "local_dir": env.get("LOCAL_OUTPUT_DIR", ""),
     }
 
 
-def window_name(prefix, window_start):
+def parse_streams(text):
+    """"name=filter,name=filter" -> [(name, filter), ...], in order."""
+    streams = []
+    for part in text.split(","):
+        name, sep, topic = part.partition("=")
+        name, topic = name.strip().strip("/"), topic.strip()
+        if not sep or not name or not topic or "/" in name:
+            raise SystemExit("MQTT_STREAMS: %r is not name=topic-filter" % part.strip())
+        streams.append((name, topic))
+    return streams
+
+
+def window_name(stream, window_start):
     start = datetime.fromtimestamp(window_start, timezone.utc)
-    return "%s/%s/mqtt_%s.jsonl" % (prefix, start.strftime("%Y/%m/%d"), start.strftime("%Y%m%dT%H%MZ"))
+    return "%s/%s/%s_%s.jsonl" % (stream, start.strftime("%Y/%m/%d"), stream, start.strftime("%Y%m%dT%H%MZ"))
 
 
 def with_suffix(name, n):
@@ -135,14 +171,17 @@ class LocalStore:
 
 
 class Recorder:
-    def __init__(self, config, store):
+    def __init__(self, config, store, client_id):
         self.config = config
         self.store = store
         self.window_s = config["window_s"]
+        self.heartbeat_topic = HEARTBEAT_TOPIC + client_id
         self.lock = threading.Lock()
-        self.windows = {}  # window start (unix s) -> list of JSON lines
+        self.streams = config["streams"]
+        self.windows = {}  # (window start (unix s), stream) -> list of JSON lines
         self.received = 0
         self.uploaded_files = 0
+        self.last_heartbeat = time.time()  # last heartbeat that came back (start counts as one)
 
     # ---- MQTT (paho's thread) ------------------------------------------------------------
 
@@ -150,28 +189,39 @@ class Recorder:
         if reason_code.is_failure:
             log.warning("broker refused the connection: %s", reason_code)
             return
-        for topic in self.config["topics"]:
+        for topic in sorted({t for _, t in self.streams}) + [self.heartbeat_topic]:
             client.subscribe(topic, qos=1)
-        log.info("connected to %s:%d, recording %s", self.config["host"], self.config["port"], ", ".join(self.config["topics"]))
+        log.info("connected to %s:%d, recording %s", self.config["host"], self.config["port"],
+                 ", ".join("%s (%s)" % (name, topic) for name, topic in self.streams))
 
     def on_disconnect(self, client, userdata, flags, reason_code, properties):
         log.warning("disconnected from the broker: %s", reason_code)
 
     def on_message(self, client, userdata, message):
-        now = time.time()
-        record = {"t": datetime.fromtimestamp(now, timezone.utc).isoformat(timespec="milliseconds"),
-                  "unix": round(now, 3), "topic": message.topic}
-        if message.retain:
-            record["retained"] = True
+        # Runs in paho's network thread: an exception escaping from here would end it.
         try:
-            record["data"] = json.loads(message.payload)
-        except ValueError:
-            record["raw"] = message.payload.decode("utf-8", "replace")
-        line = json.dumps(record, separators=(",", ":"))
-        window = int(now // self.window_s) * self.window_s
-        with self.lock:
-            self.windows.setdefault(window, []).append(line)
-            self.received += 1
+            now = time.time()
+            if message.topic == self.heartbeat_topic:
+                self.last_heartbeat = now
+                return
+            stream = next((name for name, topic in self.streams if mqtt.topic_matches_sub(topic, message.topic)), None)
+            if stream is None:
+                return  # a retained message on an overlapping subscription, or similar
+            record = {"t": datetime.fromtimestamp(now, timezone.utc).isoformat(timespec="milliseconds"),
+                      "unix": round(now, 3), "topic": message.topic}
+            if message.retain:
+                record["retained"] = True
+            try:
+                record["data"] = json.loads(message.payload)
+            except ValueError:
+                record["raw"] = message.payload.decode("utf-8", "replace")
+            line = json.dumps(record, separators=(",", ":"))
+            window = int(now // self.window_s) * self.window_s
+            with self.lock:
+                self.windows.setdefault((window, stream), []).append(line)
+                self.received += 1
+        except Exception:
+            log.exception("could not record a message on %s; skipped", getattr(message, "topic", "?"))
 
     # ---- flushing (main thread) ---------------------------------------------------------
 
@@ -180,10 +230,10 @@ class Recorder:
         A failed upload stays pending for the next flush."""
         current = int(time.time() // self.window_s) * self.window_s
         with self.lock:
-            ready = sorted(w for w in self.windows if include_open or w < current)
-            batches = [(w, self.windows.pop(w)) for w in ready]
-        for i, (window, lines) in enumerate(batches):
-            name = window_name(self.config["prefix"], window)
+            ready = sorted(key for key in self.windows if include_open or key[0] < current)
+            batches = [(key, self.windows.pop(key)) for key in ready]
+        for i, ((window, stream), lines) in enumerate(batches):
+            name = window_name(stream, window)
             try:
                 stored = self.store.put(name, ("\n".join(lines) + "\n").encode("utf-8"))
             except Exception as e:  # keep it, and everything after it, for the next try
@@ -191,10 +241,10 @@ class Recorder:
                 with self.lock:
                     for w, l in batches[i:]:
                         self.windows[w] = l + self.windows.get(w, [])
-                    while len(self.windows) > MAX_PENDING_WINDOWS:
+                    while len(self.windows) > MAX_PENDING_WINDOWS * len(self.streams):
                         dropped = min(self.windows)
                         log.error("dropping window %s: %d messages could not be uploaded",
-                                  window_name(self.config["prefix"], dropped), len(self.windows.pop(dropped)))
+                                  window_name(dropped[1], dropped[0]), len(self.windows.pop(dropped)))
                 return
             self.uploaded_files += 1
             log.info("wrote %s (%d messages)", stored, len(lines))
@@ -209,10 +259,11 @@ def main():
     logging.getLogger("azure").setLevel(logging.WARNING)
     config = settings()
     store = LocalStore(config["local_dir"]) if config["local_dir"] else BlobStore(config["account_url"], config["container"])
-    recorder = Recorder(config, store)
-    log.info("recording to %s/%s in %d s windows", store.where, config["prefix"], config["window_s"])
+    client_id = "audrey-logger-" + uuid.uuid4().hex[:8]
+    recorder = Recorder(config, store, client_id)
+    log.info("recording to %s in %d s windows", store.where, config["window_s"])
 
-    client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, client_id="audrey-logger-" + uuid.uuid4().hex[:8])
+    client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, client_id=client_id)
     client.username_pw_set(config["user"], config["password"])
     client.tls_set(ca_certs=config["ca_file"])
     client.on_connect = recorder.on_connect
@@ -226,15 +277,31 @@ def main():
     stopping = threading.Event()
     signal.signal(signal.SIGTERM, lambda signum, frame: stopping.set())
     signal.signal(signal.SIGINT, lambda signum, frame: stopping.set())
+    exit_code = 0
+    next_flush = time.time() + recorder.seconds_to_next_flush()
+    next_heartbeat = time.time()
     try:
-        while not stopping.wait(max(0.0, recorder.seconds_to_next_flush())):
-            recorder.flush()
-        log.info("stopping: uploading what is left")
+        while not stopping.wait(max(0.0, min(next_flush, next_heartbeat) - time.time())):
+            now = time.time()
+            if now >= next_heartbeat:
+                next_heartbeat = now + HEARTBEAT_S
+                client.publish(recorder.heartbeat_topic, "%.0f" % now, qos=1)  # fails quietly while disconnected
+                silent = now - recorder.last_heartbeat
+                if silent > HEARTBEAT_TIMEOUT_S:
+                    log.error("no heartbeat back from the broker for %.0f s: exiting so the platform restarts this", silent)
+                    exit_code = 1
+                    break
+            if now >= next_flush:
+                recorder.flush()
+                next_flush = time.time() + recorder.seconds_to_next_flush()
+        else:
+            log.info("stopping: uploading what is left")
     finally:
         client.loop_stop()
         client.disconnect()
         recorder.flush(include_open=True)
         log.info("stopped after %d messages, %d files written", recorder.received, recorder.uploaded_files)
+    sys.exit(exit_code)
 
 
 if __name__ == "__main__":
