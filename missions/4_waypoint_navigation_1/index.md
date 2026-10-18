@@ -111,6 +111,4 @@ moments, left out of the numbers.
 4. **Course on board:** compute the course from positions in the navigation code instead of
    using the GPS module's frozen output.
 5. **Re-tune the rudder gain** after the heading source changes, and check again at higher
-   throttle, before going far from shore.
-6. **Next mission:** repeat with full slow circles in both directions, so the compass is checked
-   at every heading.
+   throttle.
