@@ -16,4 +16,4 @@ The intent of this project is to explore capabilities of consumer/hobby grade mo
 1. [Chassis testing](missions/1_chassis_testing/index.md) — first on-water run: water ingress and power consumption
 2. [GPS precision testing](missions/2_gps_precision_testing/index.md) — GNSS precision, boat speed, time to fix
 3. [Control test](missions/3_control_test/index.md) — dry-land check of the control chain: commands, RC takeover, telemetry
-4. (Planned) [Waypoint navigation](missions/4_waypoint_navigation/index.md)
+4. [Waypoint navigation #1](missions/4_waypoint_navigation_1/index.md) — first autonomous runs to three destinations: GPS against a reference, compass accuracy, rudder behaviour
