@@ -18,7 +18,9 @@ the last update, and resets the chip with a command.
 The Rotation Vector report fuses accel + gyro + magnetometer into an absolute heading, as
 opposed to the driver's default "Game Rotation Vector" (accel + gyro only), which has no
 absolute reference and drifts. set_quaternion_euler_vector() switches the euler/quaternion
-properties to read the Rotation Vector instead.
+properties to read the Rotation Vector instead. The Game Rotation Vector is enabled too and
+read as gyro_yaw: unaffected by magnetic fields, it is the main input of virtual_compass.py,
+which turns it, this heading and the GPS track into the heading the navigation uses.
 
 The Magnetometer report is enabled too, only for its accuracy field: the driver takes the
 magnetometer calibration accuracy (0..3) from those reports and nowhere else. Without them
@@ -46,12 +48,13 @@ at magnetic north, increasing clockwise. Both were checked on the boat; recheck 
 remounting the sensor: bow north should read 0 (or 360), and a quarter turn to the right 90.
 """
 
+import math
 import time
 
 from machine import UART
 
-from bno08x import (BNO08X, BNO_REPORT_MAGNETOMETER, BNO_REPORT_ROTATION_VECTOR, ME_SAVE_DCD_PERIODIC_CDE,
-                    REPORT_ACCURACY_STATUS, UART_BAUDRATE)
+from bno08x import (BNO08X, BNO_REPORT_GAME_ROTATION_VECTOR, BNO_REPORT_MAGNETOMETER, BNO_REPORT_ROTATION_VECTOR,
+                    ME_SAVE_DCD_PERIODIC_CDE, REPORT_ACCURACY_STATUS, UART_BAUDRATE)
 
 ROTATION_VECTOR_HZ = 10  # sensor's internal update rate
 MAGNETOMETER_HZ = 2  # only read for its calibration accuracy, which changes slowly
@@ -106,8 +109,17 @@ class Compass:
         self.stamp = 0
         self.seen = False
 
+        # The gyro yaw: the game rotation vector, gyro and accelerometer only (no
+        # magnetometer), so no magnetic field disturbs it, but its zero is wherever the chip
+        # started and it drifts slowly. virtual_compass.py turns it into the heading.
+        self.gyro_yaw = 0.0  # degrees, 0..360, increasing clockwise like heading
+        self.last_gyro_report = self.bno._readings.get(BNO_REPORT_GAME_ROTATION_VECTOR)
+        self.gyro_stamp = 0
+        self.gyro_seen = False
+
     def _enable_reports(self):
         self.bno.enable_feature(BNO_REPORT_ROTATION_VECTOR, self.rate_hz)
+        self.bno.enable_feature(BNO_REPORT_GAME_ROTATION_VECTOR, self.rate_hz)
         self.bno.enable_feature(BNO_REPORT_MAGNETOMETER, MAGNETOMETER_HZ)
         self.bno.calibration()  # turn on continuous accel/gyro/mag self-calibration
 
@@ -127,6 +139,14 @@ class Compass:
             self.heading = (HEADING_SIGN * pan + HEADING_OFFSET_DEG) % 360
             self.stamp = now
             self.seen = True
+        game = self.bno._readings.get(BNO_REPORT_GAME_ROTATION_VECTOR)
+        if game is not self.last_gyro_report:
+            self.last_gyro_report = game
+            i, j, k, real = game[0], game[1], game[2], game[3]
+            yaw = math.degrees(math.atan2(2.0 * (real * k + i * j), 1.0 - 2.0 * (j * j + k * k)))
+            self.gyro_yaw = (HEADING_SIGN * yaw) % 360
+            self.gyro_stamp = now
+            self.gyro_seen = True
 
         # Kept up to date from the Magnetometer reports read along with the heading. (The
         # driver's calibration_status property returns the same value, after sending a
@@ -156,6 +176,10 @@ class Compass:
     def fresh(self, now, max_age_ms):
         """A new heading arrived within max_age_ms."""
         return self.seen and time.ticks_diff(now, self.stamp) <= max_age_ms
+
+    def gyro_fresh(self, now, max_age_ms):
+        """A new gyro yaw arrived within max_age_ms."""
+        return self.gyro_seen and time.ticks_diff(now, self.gyro_stamp) <= max_age_ms
 
     def describe(self):
         """One-line status for the console."""

@@ -8,7 +8,8 @@ so a network stall can't hold up the loop.
 
   task        period   what
   control       50 ms  decide throttle/rudder, send to the body control unit (bcu.py)
-  compass      100 ms  read heading (compass.py), print it on the console
+  compass      100 ms  read heading and gyro yaw (compass.py), print the heading on the console,
+                       update the virtual compass
   gps          100 ms  read NMEA from the L76K GNSS module on a UART (gps.py)
   bcu_status  1000 ms  read the Pico's status block
   mqtt        1000 ms  handle received commands, queue telemetry
@@ -51,9 +52,14 @@ telemetry. Those with a "cmd" the controller knows are acted on:
   {"cmd": "clear_destination"}                               forget it
 The destination isn't kept across a restart.
 
+Heading: the virtual compass (virtual_compass.py), updated on every compass read from the
+chip's gyro yaw, its magnetic heading and the GPS fixes. The magnetic heading alone is still
+what the console prints and telemetry reports as compass "heading"; the virtual one is in
+telemetry as compass "virtual".
+
 Navigation: once the heading and the GPS fix are good and there is a destination, control()
 asks gnc.py for throttle and rudder, handing it the destination, the latest fix, motion and
-heading with their timestamps (gnc.NavInputs). What gnc.py based its answer on (distance,
+the virtual heading with their timestamps (gnc.NavInputs). What gnc.py based its answer on (distance,
 course to steer, course error) goes out in telemetry as "nav".
 """
 
@@ -69,6 +75,7 @@ from machine import I2C, Pin, SoftI2C
 
 import gnc
 from bcu import BodyControlUnit
+from virtual_compass import VirtualCompass
 from gps import GpsLink
 
 # compass (and its large bno08x driver) is imported only after WiFi has started; see
@@ -131,6 +138,25 @@ COMPASS_MAX_AGE_MS = 500  # a heading older than this isn't used for control
 COMPASS_LOST_MS = 3000  # no new heading for this long: re-enable its reports (no reset, ms);
 # still none COMPASS_LOST_MS later: re-initialize it, which resets the chip (~1.5 s blocking)
 COMPASS_RETRY_MS = 10000  # re-initialize at most this often
+FORWARD_THROTTLE_US = 1520  # throttle output above this = driving forward (1500 is neutral)
+
+# ---- Rudder trim ----
+# The rudder pulse that keeps the boat straight, from config.py's "rudder_center_us" (the
+# same value the transmitter's rudder trim gives; the Body Control Unit's neutral is 1500).
+# Every rudder command from the autopilot is shifted by it before it goes out.
+RUDDER_NEUTRAL_US = 1500
+RUDDER_US_PER_PERCENT = 5  # the Body Control Unit maps -100..100 % to 1000..2000 us
+
+
+def load_rudder_trim():
+    """The trim in % of rudder (0 if config.py doesn't set it)."""
+    try:
+        from config import config
+
+        center_us = config.get("rudder_center_us", RUDDER_NEUTRAL_US)
+    except Exception:
+        center_us = RUDDER_NEUTRAL_US
+    return round((center_us - RUDDER_NEUTRAL_US) / RUDDER_US_PER_PERCENT)
 I2C_RECOVERY_AFTER_FAILS = 20  # consecutive failed writes to the Pico (1 s at 20 Hz)
 I2C_RECOVERY_INTERVAL_MS = 5000  # doubles after each recovery that didn't help...
 I2C_RECOVERY_MAX_INTERVAL_MS = 60000  # ...up to this; back to the start on a good write
@@ -261,12 +287,16 @@ class Controller:
         self.compass_init_at = None  # last init
         self.compass_inits = 0
         self.compass_restart_tried = False  # reports re-enabled since the last heading
+        self.vcompass = VirtualCompass()  # the heading navigation uses (gyro + compass + GPS)
         self.try_init_compass(time.ticks_ms())
 
         self.i2c_fail_streak = 0
         self.i2c_recoveries = 0
         self.last_i2c_recovery = None
         self.i2c_recovery_interval = I2C_RECOVERY_INTERVAL_MS
+
+        self.rudder_trim = load_rudder_trim()  # %, added to every rudder command
+        print("rudder trim: %+d %% (%d us)" % (self.rudder_trim, RUDDER_NEUTRAL_US + RUDDER_US_PER_PERCENT * self.rudder_trim))
 
         # Latest control decision, for telemetry and the console.
         self.throttle = 0
@@ -315,6 +345,7 @@ class Controller:
             from compass import Compass
 
             self.compass = Compass(BOARD["compass_uart"], BOARD["compass_rx"], BOARD["compass_tx"])
+            self.vcompass.reset()  # a re-initialised chip starts its gyro yaw from a new zero
             self.compass_inits += 1
             print("compass ready (init #%d)" % self.compass_inits)
         except Exception as e:
@@ -324,7 +355,8 @@ class Controller:
 
     def control(self, now):
         self.throttle, self.rudder, self.reason = self.decide(now)
-        if self.bcu.send(self.throttle, self.rudder):
+        # The autopilot decides around 0 = straight; the trim makes that the boat's straight.
+        if self.bcu.send(self.throttle, self.rudder + self.rudder_trim):
             self.i2c_fail_streak = 0
             self.i2c_recovery_interval = I2C_RECOVERY_INTERVAL_MS
         else:
@@ -366,8 +398,8 @@ class Controller:
         nav.sog_kn = gps.sog_kn
         nav.cog_deg = gps.cog_deg
         nav.motion_ms = gps.motion_stamp
-        nav.heading = compass.heading
-        nav.heading_ms = compass.stamp
+        nav.heading = self.vcompass.heading
+        nav.heading_ms = self.vcompass.stamp
         nav.heading_accuracy = compass.accuracy
         return nav
 
@@ -378,6 +410,9 @@ class Controller:
             print("%.1f" % compass.heading)
             if compass.fresh(now, COMPASS_LOST_MS):
                 self.compass_restart_tried = False
+            # Last, so an error in it can't hold up the compass's own recovery. If it keeps
+            # failing, its heading stops updating and heading_ok() turns it down.
+            self.update_virtual_compass(now)
             return
         if compass is not None and not self.compass_restart_tried:
             # Cheap first: re-enable the reports. Re-initializing would reset the chip, which
@@ -388,6 +423,24 @@ class Controller:
             compass.restart_reports()  # an error here is counted by the task
         elif time.ticks_diff(now, self.compass_init_at) >= COMPASS_RETRY_MS:
             self.try_init_compass(now)
+
+    def update_virtual_compass(self, now):
+        compass = self.compass
+        gps = self.gps
+        fix = (gps.seq, gps.fix_stamp, gps.lat_e7, gps.lon_e7) if gps.fix_valid(now) else None
+        self.vcompass.update(
+            now,
+            compass.gyro_yaw if compass.gyro_fresh(now, COMPASS_MAX_AGE_MS) else None, compass.gyro_stamp,
+            compass.heading if compass.fresh(now, COMPASS_MAX_AGE_MS) else None, compass.stamp,
+            fix, self.moving_forward())
+
+    def moving_forward(self):
+        """The propeller is pushing forward: from what the Body Control Unit drives the ESC with
+        (so RC driving counts too), or from our own command if its status isn't available."""
+        status = self.bcu.status_dict()
+        if status is not None and status.get("out_throttle_us"):
+            return status["out_throttle_us"] > FORWARD_THROTTLE_US
+        return self.throttle > 0
 
     def read_gps(self, now):
         self.gps.poll(now)
@@ -428,7 +481,12 @@ class Controller:
         return line if self.compass.fresh(now, COMPASS_MAX_AGE_MS) else line + " (STALE)"
 
     def heading_ok(self, now):
-        return self.compass is not None and self.compass.fresh(now, COMPASS_MAX_AGE_MS)
+        """The virtual compass's heading was updated from a gyro reading newer than
+        COMPASS_MAX_AGE_MS. (Its own time stamp, not the compass's: if the virtual compass
+        stops updating for any reason, its last heading must not be used.)"""
+        vc = self.vcompass
+        return (self.compass is not None and vc.heading is not None and vc.stamp is not None
+                and time.ticks_diff(now, vc.stamp) <= COMPASS_MAX_AGE_MS)
 
     def handle_command(self, payload, received_ms):
         """Parses, records and applies a command (see the list at the top of this file)."""
@@ -493,9 +551,12 @@ class Controller:
             "link": self.mqtt.status_dict(),
             "reset_cause": self.reset_cause,
             "memory": memory_stats(),
-            "output": {"throttle": self.throttle, "rudder": self.rudder, "reason": self.reason},
+            "output": {"throttle": self.throttle, "rudder": self.rudder, "reason": self.reason,
+                       "rudder_trim": self.rudder_trim},  # sent to the Body Control Unit: rudder + rudder_trim
             "compass": None if compass is None else {
                 "heading": compass.heading,
+                "gyro_yaw": round(compass.gyro_yaw, 1),
+                "virtual": self.vcompass.status_dict(),
                 "accuracy": compass.accuracy,
                 "fresh": compass.fresh(now, COMPASS_MAX_AGE_MS),
                 "inits": self.compass_inits,

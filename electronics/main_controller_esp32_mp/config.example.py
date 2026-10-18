@@ -10,4 +10,7 @@ config = {
     "mqtt_user": "your-mqtt-username",
     "mqtt_password": "your-mqtt-password",
     "mqtt_ca_file": "mqtt_ca.pem",
+    # The rudder pulse (us) that keeps the boat going straight: the same as the transmitter's
+    # rudder trim. The autopilot's rudder commands are shifted by it. 1500 = no trim.
+    "rudder_center_us": 1500,
 }

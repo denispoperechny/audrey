@@ -104,18 +104,40 @@ def show_battery(snap, cells):
         st.warning("Last known value, %s: the Pico's status isn't coming through right now." % ago(time.time() - at))
 
 
+def boat_heading(compass):
+    """(heading, is_virtual) the boat navigates by: its virtual compass (gyro, corrected by the
+    GPS track and the magnetic compass; see the boat's virtual_compass.py), or the magnetic
+    heading from boat software that predates it. (None, False) if there is neither."""
+    virtual = (compass or {}).get("virtual") or {}
+    if virtual.get("heading") is not None:
+        return virtual["heading"], True
+    if (compass or {}).get("heading") is not None:
+        return compass["heading"], False
+    return None, False
+
+
 def show_compass(latest):
     st.subheader("Compass")
     compass = latest.get("compass")
-    if compass is None or compass.get("heading") is None:
+    heading, is_virtual = boat_heading(compass)
+    if heading is None:
         st.info("No compass on the boat right now.")
         return
-    heading = compass["heading"]
     fresh = bool(compass.get("fresh"))
     accuracy = compass.get("accuracy") or 0
     st.markdown(compass_svg(heading, fresh), unsafe_allow_html=True)
-    st.metric("Heading (magnetic)", "%.0f° %s" % (heading, COMPASS_POINTS[round(heading / 22.5) % 16]))
-    st.caption("Calibration: %s (%d/3)" % (ACCURACY_NAMES[min(max(accuracy, 0), 3)], accuracy))
+    st.metric("Heading", "%.0f° %s" % (heading, COMPASS_POINTS[round(heading / 22.5) % 16]),
+              help="Degrees from magnetic north. The heading the boat navigates by.")
+    if is_virtual:
+        virtual = compass["virtual"]
+        st.caption("Virtual compass: gyro, corrected by the GPS track (%d corrections so far) and the magnetic compass." % (
+            virtual.get("gps_corrections") or 0))
+        st.caption("Magnetic compass alone: %.0f° (%+.0f° from the heading); calibration %s (%d/3)." % (
+            compass["heading"], ((compass["heading"] - heading + 180) % 360) - 180,
+            ACCURACY_NAMES[min(max(accuracy, 0), 3)], accuracy))
+    else:
+        st.caption("Magnetic compass (the boat's software has no virtual compass). Calibration: %s (%d/3)" % (
+            ACCURACY_NAMES[min(max(accuracy, 0), 3)], accuracy))
     if not fresh:
         st.warning("Stale: no new heading from the compass.")
 
@@ -151,8 +173,9 @@ def show_map(latest, track, follow):
             "PathLayer", [{"path": [[p[1], p[0]] for p in track]}],
             get_path="path", get_color=[30, 120, 220], width_min_pixels=3))
     compass = latest.get("compass") or {}
-    if compass.get("heading") is not None and compass.get("fresh"):
-        tip = point_ahead(lat, lon, compass["heading"], HEADING_LINE_M)
+    heading, _ = boat_heading(compass)
+    if heading is not None and compass.get("fresh"):
+        tip = point_ahead(lat, lon, heading, HEADING_LINE_M)
         layers.append(pdk.Layer(
             "LineLayer", [{"from": [lon, lat], "to": [tip[1], tip[0]]}],
             get_source_position="from", get_target_position="to",

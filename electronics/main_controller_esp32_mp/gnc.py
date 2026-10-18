@@ -8,8 +8,9 @@ A simple first version, for ground tests. Each control pass (move_to_destination
   3. Closer than ARRIVAL_RADIUS_M: stop (_stop). Otherwise steer (_set_course): rudder in
      proportion to the difference between that course and the compass heading, throttle
      reduced as the rudder grows.
-The heading is the compass's alone and the speed and course over ground are the GPS
-module's own (from Doppler); nothing is fused, filtered or remembered between passes.
+The heading comes from the virtual compass (virtual_compass.py: gyro, corrected slowly by
+the magnetic compass and the GPS track); the speed and course over ground are the GPS
+module's own (from Doppler). Nothing else is filtered or remembered between passes.
 
 Still open, roughly in priority order:
 
@@ -88,7 +89,7 @@ class NavInputs:
         self.cog_deg = 0.0  # course over ground, degrees true; meaningless at standstill
         self.motion_ms = 0
 
-        self.heading = 0.0  # compass, degrees magnetic, 0..360 clockwise
+        self.heading = 0.0  # virtual compass (virtual_compass.py), degrees magnetic, 0..360 clockwise
         self.heading_ms = 0
         self.heading_accuracy = 0  # magnetometer calibration, 0 (unreliable) .. 3 (high)
 

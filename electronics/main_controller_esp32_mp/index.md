@@ -110,5 +110,17 @@ Over MQTT with TLS, on two topics (set in [`mqtt.py`](mqtt.py)):
   the destination and what navigation made of it, error counters for every task and link,
   WiFi signal strength and memory.
 
+## Post- Mission 4 Compass correction
+
+Mission 4 did show the magnetic compass has a significant level of error, pressumably due to magnetic and electric fields onboard created by the electric motor and wire lines.  
+  
+The quick test has proven the BNO-08X has a good yaw gyro and Mission 4 did show GPS readings provide good enough accuracy for heading direction approximation. Compass stays the only long-term reference for stationary UxV.  
+  
+Solution - the virtual composite compass is implemented:
+- the main compass input is a gyro
+- magnetic compass provdes a 0.5% per second value correcton to it
+- GPS-based 5%/second correction is applied when the vehicle moves forward with the speed above 0.5 m/s
+- the initial heading value is sourced from the magnetic compass
+
 
 
