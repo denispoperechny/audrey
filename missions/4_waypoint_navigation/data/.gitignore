@@ -1,0 +1,4 @@
+# Raw logs hold the boat's and the phone's real GPS positions: kept out of the repo, like
+# missions 2 and 3. The .placeholder files keep the folders.
+mqtt/*.jsonl
+ref_gps_track/*.kml
