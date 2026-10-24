@@ -2,6 +2,7 @@
    CAMERA_TEST_AZURE=1 python -m pytest -q   the same tests against the Azure container from
                                              .env, in a throwaway folder that is deleted after"""
 
+import io
 import os
 import tempfile
 import threading
@@ -9,6 +10,7 @@ import uuid
 from datetime import datetime, timedelta, timezone
 
 import pytest
+from PIL import Image
 from dotenv import dotenv_values
 
 AZURE = bool(os.environ.get("CAMERA_TEST_AZURE"))
@@ -26,6 +28,7 @@ else:
 from fastapi.testclient import TestClient  # noqa: E402
 
 import main  # noqa: E402
+import marks  # noqa: E402
 
 
 @pytest.fixture(scope="session", autouse=True)
@@ -37,7 +40,13 @@ def clean_up_azure():
 client = TestClient(main.app, base_url="http://testserver" + main.API_PREFIX)
 DEFAULTS = {"frame_size": "FHD", "jpeg_quality": 8, "hmirror": True, "vflip": False, "settle_ms": 1000,
             "gain_ceiling": "32X", "night_mode": False, "ae_level": 2}
-JPEG = b"\xff\xd8\xff\xe0" + b"fake jpeg body" * 100 + b"\xff\xd9"
+def make_jpeg(width=640, height=480):
+    out = io.BytesIO()
+    Image.new("RGB", (width, height), (40, 90, 160)).save(out, "JPEG")
+    return out.getvalue()
+
+
+JPEG = make_jpeg()
 
 
 def drain():
@@ -133,7 +142,7 @@ def test_upload_completes_the_task_and_the_picture_can_be_fetched():
     stored = datetime.fromisoformat(done["taken_at"])  # kept to the millisecond
     assert abs(stored - datetime.fromisoformat(taken.replace("Z", "+00:00"))) < timedelta(milliseconds=1)
     assert done["uploaded_at"] >= done["taken_at"]
-    got = client.get("/picture-tasks/%s/picture" % task["id"])
+    got = client.get("/picture-tasks/%s/picture" % task["id"], params={"marks": "false"})
     assert got.status_code == 200 and got.content == JPEG and got.headers["content-type"] == "image/jpeg"
     assert [t["id"] for t in client.get("/picture-tasks", params={"status": "done"}).json()][0] == task["id"]
 
@@ -198,3 +207,30 @@ def test_web_page():
     page = root.get("/")
     assert page.status_code == 200 and "text/html" in page.headers["content-type"]
     assert root.get("/api/openapi.json").json()["components"]["schemas"]["PictureParams"]
+
+
+def test_picture_is_served_with_the_marks_unless_asked_not_to():
+    task = claimed_task()
+    assert upload(task["id"]).status_code == 200
+    got = client.get("/picture-tasks/%s/picture" % task["id"])
+    assert got.status_code == 200 and got.headers["content-type"] == "image/jpeg"
+    image = Image.open(io.BytesIO(got.content)).convert("RGB")
+    assert image.size == (640, 480)
+    # The rectangle's left edge, half way down it: red where the original is blue.
+    r, g, b = image.getpixel((round(320 - 640 * marks.BOX_W / 2), round(480 * marks.CENTER_Y)))
+    assert r > 150 and g < 80 and b < 80, (r, g, b)
+    assert client.get("/picture-tasks/%s/picture" % task["id"]).content == got.content  # the cached copy
+
+
+def test_a_picture_that_cannot_be_decoded_is_served_as_it_came():
+    task = claimed_task()
+    broken = b"\xff\xd8\xff\xe0" + b"not really a jpeg" * 50
+    assert upload(task["id"], data=broken).status_code == 200
+    assert client.get("/picture-tasks/%s/picture" % task["id"]).content == broken
+
+
+def test_angle_marks_land_where_the_clock_calibration_put_them():
+    # QXGA: +-24 deg (4 minute ticks of the clock) measured at 571 and 1572, about 500 px either
+    # side of the 6; the model puts +-25 deg a quarter of the width either side of the centre.
+    assert abs(marks.x_of(0, 2048) - 1024) < 1
+    assert abs(marks.x_of(-25, 2048) - 512) < 5 and abs(marks.x_of(25, 2048) - 1536) < 5

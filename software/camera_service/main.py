@@ -12,7 +12,8 @@ Requestor:
                                         PictureParams: anything left out takes its default)
     GET  /picture-tasks                 list tasks, newest first (?status=pending|assigned|done)
     GET  /picture-tasks/{id}            one task
-    GET  /picture-tasks/{id}/picture    the picture, once it has been uploaded
+    GET  /picture-tasks/{id}/picture    the picture, once it has been uploaded, with the navigation
+                                        marks drawn on (see marks.py); ?marks=false: as taken
     GET  /picture-defaults              the parameters used when none are given
     GET  /health                        "ok" if the service is up (for probes); touches no storage
 
@@ -39,6 +40,7 @@ Task ids are GUIDs. Where tasks and pictures are kept is set in .env (see .env.e
 
 import os
 import uuid
+from collections import OrderedDict
 from datetime import datetime, timedelta, timezone
 from enum import Enum
 from pathlib import Path
@@ -49,11 +51,13 @@ from fastapi import APIRouter, FastAPI, HTTPException, Query, Request, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, Field
 
+from marks import marked
 from store import LocalTaskStore, now_utc
 
 API_PREFIX = "/api"
 MAX_PICTURE_BYTES = 5 * 1024 * 1024  # a full-size JPEG from the XIAO is 0.1-0.5 MB
 MAX_CLOCK_AHEAD = timedelta(minutes=5)  # a taken_at further in the future than this is refused
+MARKED_CACHE_SIZE = 50  # marked pictures kept in memory (a picture never changes once uploaded)
 
 
 class FrameSize(str, Enum):
@@ -138,6 +142,7 @@ def open_store():
 
 
 store = open_store()
+marked_cache = OrderedDict()  # task id -> marked JPEG, most recently used last
 
 app = FastAPI(title="Audrey camera service", version="0.2",
               description="Orders for pictures, a queue the camera picks them up from, and the pictures.",
@@ -212,10 +217,21 @@ async def upload_picture(task_id: uuid.UUID, request: Request,
 
 @api.get("/picture-tasks/{task_id}/picture", response_class=Response,
          responses={200: {"content": {"image/jpeg": {}}}, 404: {"description": "no such task or no picture yet"}})
-def get_picture(task_id: uuid.UUID):
+def get_picture(task_id: uuid.UUID, marks: bool = Query(True, description="draw the navigation marks on it")):
+    if marks and task_id in marked_cache:
+        marked_cache.move_to_end(task_id)
+        return Response(marked_cache[task_id], media_type="image/jpeg")
     data = store.picture(str(task_id))
     if data is None:
         raise HTTPException(404, "no picture for this task (yet)")
+    if marks:
+        try:
+            data = marked(data)
+        except OSError:  # a JPEG Pillow can't read: serve it as it came
+            return Response(data, media_type="image/jpeg")
+        marked_cache[task_id] = data
+        if len(marked_cache) > MARKED_CACHE_SIZE:
+            marked_cache.popitem(last=False)
     return Response(data, media_type="image/jpeg")
 
 
