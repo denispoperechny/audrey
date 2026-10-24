@@ -1,0 +1,7 @@
+# Only what the Dockerfile copies is needed; keep the rest out of the build upload.
+.venv/
+__pycache__/
+.pytest_cache/
+data/
+test_main.py
+requirements-dev.txt

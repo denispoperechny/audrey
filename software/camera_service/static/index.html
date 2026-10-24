@@ -1,0 +1,310 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Audrey camera</title>
+<style>
+  :root {
+    --bg: #f6f7f9; --panel: #fff; --ink: #1c2330; --muted: #677285; --line: #dde1e8;
+    --accent: #1f6feb; --accent-ink: #fff; --error: #c62828;
+    --pending: #8a6d00; --pending-bg: #fff4c2; --assigned: #0b5cad; --assigned-bg: #dcebff;
+    --done: #1b6e3a; --done-bg: #d8f3e1;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #12151b; --panel: #1b2029; --ink: #e4e8ef; --muted: #98a2b3; --line: #2c3340;
+      --accent: #4c8dff; --accent-ink: #0b0e13; --error: #ff6b6b;
+      --pending: #ffd866; --pending-bg: #3a3215; --assigned: #8cbcff; --assigned-bg: #1a2c47;
+      --done: #7fdc9f; --done-bg: #173323;
+    }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--ink);
+         font: 14px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif; }
+  header { padding: 14px 16px; border-bottom: 1px solid var(--line); background: var(--panel);
+           display: flex; align-items: baseline; gap: 12px; }
+  header h1 { font-size: 18px; margin: 0; }
+  header .muted { font-size: 12px; }
+  main { display: grid; grid-template-columns: 350px 1fr; gap: 16px; padding: 16px; max-width: 1400px; margin: 0 auto; }
+  @media (max-width: 800px) { main { grid-template-columns: 1fr; } }
+  section { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 14px; min-width: 0; }
+  h2 { font-size: 15px; margin: 0 0 12px; display: flex; align-items: center; gap: 8px; }
+  .muted { color: var(--muted); }
+  label { display: grid; grid-template-columns: 1fr 170px; align-items: center; gap: 8px; margin-bottom: 8px; }
+  a { color: var(--accent); }
+  label small { display: block; color: var(--muted); font-size: 11px; }
+  input, select { font: inherit; color: inherit; background: var(--bg); border: 1px solid var(--line);
+                  border-radius: 5px; padding: 4px 6px; width: 100%; }
+  input[type=checkbox] { width: auto; justify-self: start; }
+  button { font: inherit; border: 1px solid var(--line); background: var(--bg); color: inherit;
+           border-radius: 5px; padding: 6px 12px; cursor: pointer; }
+  button.primary { background: var(--accent); color: var(--accent-ink); border-color: var(--accent); font-weight: 600; }
+  button:disabled { opacity: .6; cursor: default; }
+  .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+  .spacer { flex: 1; }
+  #message { min-height: 20px; margin-top: 8px; font-size: 13px; }
+  #message.error { color: var(--error); }
+  .tasks { display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 12px; }
+  .task { border: 1px solid var(--line); border-radius: 8px; overflow: hidden; background: var(--bg); cursor: pointer; }
+  .task:hover { border-color: var(--accent); }
+  .thumb { aspect-ratio: 4 / 3; background: var(--line); display: flex; align-items: center; justify-content: center;
+           color: var(--muted); font-size: 12px; }
+  .thumb img { width: 100%; height: 100%; object-fit: cover; display: block; }
+  .info { padding: 8px 10px; font-size: 12px; }
+  .info div { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .badge { display: inline-block; padding: 1px 7px; border-radius: 10px; font-size: 11px; font-weight: 600; }
+  .badge.pending { color: var(--pending); background: var(--pending-bg); }
+  .badge.assigned { color: var(--assigned); background: var(--assigned-bg); }
+  .badge.done { color: var(--done); background: var(--done-bg); }
+  dialog { border: 1px solid var(--line); border-radius: 10px; background: var(--panel); color: var(--ink);
+           padding: 0; width: min(1100px, 96vw); max-height: 94vh; }
+  dialog::backdrop { background: rgba(0, 0, 0, .6); }
+  .viewer { display: grid; grid-template-columns: 1fr 260px; }
+  @media (max-width: 800px) { .viewer { grid-template-columns: 1fr; } }
+  .viewer .pic { background: #000; display: flex; align-items: center; justify-content: center; min-height: 200px; }
+  .viewer .pic img { max-width: 100%; max-height: 86vh; display: block; }
+  .viewer .pic .muted { padding: 40px; }
+  .viewer .details { padding: 14px; font-size: 12px; overflow: auto; max-height: 86vh; }
+  .viewer dl { display: grid; grid-template-columns: auto 1fr; gap: 3px 10px; margin: 0 0 12px; }
+  .viewer dt { color: var(--muted); }
+  .viewer dd { margin: 0; word-break: break-all; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Audrey camera</h1>
+  <span class="muted">order pictures, see what the camera took · <a href="api/docs">API</a></span>
+</header>
+<main>
+  <section>
+    <h2>New picture</h2>
+    <form id="order">
+      <div id="fields"></div>
+      <label>Requested by <input name="requested_by" maxlength="100" placeholder="optional"></label>
+      <div class="row">
+        <button type="submit" class="primary">Take picture</button>
+        <button type="button" id="reset">Defaults</button>
+      </div>
+      <div id="message"></div>
+    </form>
+  </section>
+  <section>
+    <h2>
+      Requests
+      <span class="spacer"></span>
+      <select id="filter" style="width:auto">
+        <option value="">all</option><option>pending</option><option>assigned</option><option>done</option>
+      </select>
+      <button type="button" id="refresh">Refresh</button>
+    </h2>
+    <div id="tasks" class="tasks"></div>
+    <p id="empty" class="muted" hidden>No requests yet.</p>
+  </section>
+</main>
+
+<dialog id="viewer">
+  <div class="viewer">
+    <div class="pic" id="viewer-pic"></div>
+    <div class="details">
+      <div class="row" style="margin-bottom:10px">
+        <span id="viewer-status"></span><span class="spacer"></span>
+        <button type="button" id="viewer-close">Close</button>
+      </div>
+      <dl id="viewer-info"></dl>
+      <strong>Parameters</strong>
+      <dl id="viewer-params" style="margin-top:6px"></dl>
+      <a id="viewer-download" download>Download JPEG</a>
+    </div>
+  </div>
+</dialog>
+
+<script>
+const API = "api";
+const REFRESH_MS = 5000;
+// Labels and hints for the picture parameters; the rest (types, limits, choices, defaults)
+// comes from the API's own description, so the form follows the service.
+const FIELDS = {
+  frame_size: ["Size"],
+  jpeg_quality: ["JPEG quality", "lower = better, bigger"],
+  hmirror: ["Mirror left-right", "on for this camera"],
+  vflip: ["Flip upside down"],
+  settle_ms: ["Settle time, ms", "auto exposure before the shot"],
+  gain_ceiling: ["Gain ceiling", "more = brighter, grainier"],
+  night_mode: ["Night mode", "longer exposures"],
+  ae_level: ["Exposure bias", "-2 darker .. +2 brighter"],
+};
+const SIZES = { QVGA: "320×240", VGA: "640×480", SVGA: "800×600", XGA: "1024×768", HD: "1280×720",
+                SXGA: "1280×1024", UXGA: "1600×1200", FHD: "1920×1080", QXGA: "2048×1536" };
+
+let defaults = {};
+let schemas = {};
+let shown = "";  // what the task list was last drawn from, to skip redrawing when nothing changed
+let loadFailed = false;  // the message line shows a loading error, to clear once loading works again
+
+const $ = (id) => document.getElementById(id);
+const el = (tag, props = {}, ...children) => {
+  const e = Object.assign(document.createElement(tag), props);
+  e.append(...children);
+  return e;
+};
+const when = (iso) => iso ? new Date(iso).toLocaleString() : "—";
+
+async function api(path, options) {
+  const r = await fetch(API + path, options);
+  if (!r.ok) {
+    let detail = r.statusText;
+    try { detail = JSON.stringify((await r.json()).detail); } catch (e) {}
+    throw new Error(r.status + ": " + detail);
+  }
+  return r.json();
+}
+
+function resolve(prop) {
+  // A field that is an enum comes as a $ref (or allOf [$ref]) to its schema.
+  const ref = prop.$ref || (prop.allOf && prop.allOf[0].$ref);
+  return ref ? schemas[ref.split("/").pop()] : prop;
+}
+
+function buildForm(paramsSchema) {
+  const fields = $("fields");
+  fields.replaceChildren();
+  for (const [name, prop] of Object.entries(paramsSchema.properties)) {
+    const [title, hint] = FIELDS[name] || [name];
+    const type = resolve(prop);
+    let input;
+    if (type.enum) {
+      input = el("select", { name });
+      for (const v of type.enum) input.append(el("option", { value: v, textContent: SIZES[v] ? `${v} ${SIZES[v]}` : v }));
+    } else if (prop.type === "boolean") {
+      input = el("input", { name, type: "checkbox" });
+    } else {
+      input = el("input", { name, type: "number", step: 1 });
+      if (prop.minimum !== undefined) input.min = prop.minimum;
+      if (prop.maximum !== undefined) input.max = prop.maximum;
+    }
+    fields.append(el("label", { className: prop.type === "boolean" ? "check" : "" },
+      el("span", {}, title, hint ? el("small", { textContent: hint }) : ""), input));
+  }
+  setValues(defaults);
+}
+
+function setValues(values) {
+  for (const [name, value] of Object.entries(values)) {
+    const input = $("order").elements[name];
+    if (!input) continue;
+    if (input.type === "checkbox") input.checked = value; else input.value = value;
+  }
+}
+
+function formParams() {
+  const params = {};
+  for (const name of Object.keys(defaults)) {
+    const input = $("order").elements[name];
+    params[name] = input.type === "checkbox" ? input.checked : input.type === "number" ? Number(input.value) : input.value;
+  }
+  return params;
+}
+
+function say(text, error = false) {
+  $("message").textContent = text;
+  $("message").className = error ? "error" : "muted";
+}
+
+async function order(event) {
+  event.preventDefault();
+  const button = event.submitter;
+  button.disabled = true;
+  try {
+    const body = { params: formParams() };
+    const by = $("order").elements.requested_by.value.trim();
+    if (by) body.requested_by = by;
+    const task = await api("/picture-tasks", {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
+    });
+    say(`Ordered: ${task.id.slice(0, 8)}… waiting for the camera.`);
+    await loadTasks();
+  } catch (e) {
+    say("Could not order: " + e.message, true);
+  } finally {
+    button.disabled = false;
+  }
+}
+
+function card(task) {
+  const thumb = el("div", { className: "thumb" });
+  if (task.status === "done") {
+    thumb.append(el("img", { src: `${API}/picture-tasks/${task.id}/picture`, loading: "lazy", alt: "picture" }));
+  } else {
+    thumb.textContent = task.status === "pending" ? "waiting for the camera" : "camera is taking it";
+  }
+  const node = el("div", { className: "task", title: task.id }, thumb,
+    el("div", { className: "info" },
+      el("div", {}, el("span", { className: "badge " + task.status, textContent: task.status }), " ",
+         `${task.params.frame_size} · q${task.params.jpeg_quality}`),
+      el("div", { className: "muted", textContent: "ordered " + when(task.created_at) }),
+      el("div", { className: "muted", textContent: task.taken_at ? "taken " + when(task.taken_at)
+                                                                 : (task.requested_by ? "by " + task.requested_by : " ") })));
+  node.addEventListener("click", () => openViewer(task));
+  return node;
+}
+
+async function loadTasks() {
+  const status = $("filter").value;
+  try {
+    const tasks = await api("/picture-tasks?limit=200" + (status ? "&status=" + status : ""));
+    if (loadFailed) { say(""); loadFailed = false; }
+    const key = JSON.stringify(tasks);
+    if (key === shown) return;
+    shown = key;
+    $("tasks").replaceChildren(...tasks.map(card));
+    $("empty").hidden = tasks.length > 0;
+  } catch (e) {
+    say("Could not load the requests: " + e.message, true);
+    loadFailed = true;
+  }
+}
+
+function openViewer(task) {
+  const pic = $("viewer-pic");
+  const url = `${API}/picture-tasks/${task.id}/picture`;
+  pic.replaceChildren(task.status === "done" ? el("img", { src: url, alt: "picture" })
+                                             : el("div", { className: "muted", textContent: "No picture yet (" + task.status + ")." }));
+  $("viewer-status").replaceChildren(el("span", { className: "badge " + task.status, textContent: task.status }));
+  const info = [["Task", task.id], ["Requested by", task.requested_by || "—"], ["Ordered", when(task.created_at)],
+                ["Camera", task.camera || "—"], ["Assigned", when(task.assigned_at)], ["Taken", when(task.taken_at)],
+                ["Uploaded", when(task.uploaded_at)],
+                ["Size", task.picture_bytes ? (task.picture_bytes / 1024).toFixed(0) + " KB" : "—"]];
+  $("viewer-info").replaceChildren(...info.flatMap(([k, v]) => [el("dt", { textContent: k }), el("dd", { textContent: v })]));
+  $("viewer-params").replaceChildren(...Object.entries(task.params).flatMap(
+    ([k, v]) => [el("dt", { textContent: (FIELDS[k] || [k])[0] }), el("dd", { textContent: String(v) })]));
+  const download = $("viewer-download");
+  download.hidden = task.status !== "done";
+  download.href = url;
+  download.download = `audrey_${task.id}.jpg`;
+  $("viewer").showModal();
+}
+
+async function start() {
+  try {
+    const [openapi, defs] = await Promise.all([api("/openapi.json"), api("/picture-defaults")]);
+    schemas = openapi.components.schemas;
+    defaults = defs;
+    buildForm(schemas.PictureParams);
+  } catch (e) {
+    say("Could not reach the service: " + e.message, true);
+  }
+  $("order").addEventListener("submit", order);
+  $("reset").addEventListener("click", () => setValues(defaults));
+  $("filter").addEventListener("change", () => { shown = ""; loadTasks(); });
+  $("refresh").addEventListener("click", () => { shown = ""; loadTasks(); });
+  $("viewer-close").addEventListener("click", () => $("viewer").close());
+  $("viewer").addEventListener("click", (e) => { if (e.target === $("viewer")) $("viewer").close(); });
+  await loadTasks();
+  setInterval(() => { if (!document.hidden) loadTasks(); }, REFRESH_MS);
+}
+
+start();
+</script>
+</body>
+</html>
