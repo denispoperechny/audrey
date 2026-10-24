@@ -28,6 +28,13 @@ Camera:
                                         taken_at is when the picture was taken, ISO 8601 in UTC
                                         (e.g. 2026-10-23T18:05:12.345Z)
 
+MCP (streamable HTTP, no auth), at /api/mcp:
+    get_course_correction(context_and_instructions, course_target)
+                                        takes a fresh picture, draws the course marks on it and
+                                        asks the Foundry model which way to turn (see course.py):
+                                        course_correction (degrees, + = right), confidence (0-1),
+                                        comment
+
 Task ids are GUIDs. Where tasks and pictures are kept is set in .env (see .env.example):
   CAMERA_STORAGE_ACCOUNT_URL set   in that Azure storage account: container CAMERA_STORAGE_CONTAINER
                                    (default "camera"), under an optional CAMERA_STORAGE_PREFIX.
@@ -38,6 +45,7 @@ Task ids are GUIDs. Where tasks and pictures are kept is set in .env (see .env.e
                                    and CAMERA_PICTURES (default ./data/pictures)
 """
 
+import contextlib
 import os
 import uuid
 from collections import OrderedDict
@@ -49,8 +57,12 @@ from typing import Literal, Optional
 from dotenv import load_dotenv
 from fastapi import APIRouter, FastAPI, HTTPException, Query, Request, Response
 from fastapi.staticfiles import StaticFiles
+from mcp.server.mcpserver import MCPServer
+from mcp.server.mcpserver.exceptions import ToolError
+from mcp.server.transport_security import TransportSecuritySettings
 from pydantic import BaseModel, ConfigDict, Field
 
+import course
 from marks import marked
 from store import LocalTaskStore, now_utc
 
@@ -144,7 +156,21 @@ def open_store():
 store = open_store()
 marked_cache = OrderedDict()  # task id -> marked JPEG, most recently used last
 
-app = FastAPI(title="Audrey camera service", version="0.2",
+mcp = MCPServer("audrey-camera", instructions="Steering help from Audrey's camera: get_course_correction "
+                 "takes a fresh picture and says how many degrees to turn towards a target.")
+mcp_app = mcp.streamable_http_app(
+    streamable_http_path="/mcp", stateless_http=True, json_response=True,
+    # The Host check is for servers on localhost; this one is public behind Azure's ingress.
+    transport_security=TransportSecuritySettings(enable_dns_rebinding_protection=False))
+
+
+@contextlib.asynccontextmanager
+async def lifespan(app):
+    async with mcp.session_manager.run():
+        yield
+
+
+app = FastAPI(title="Audrey camera service", version="0.2", lifespan=lifespan,
               description="Orders for pictures, a queue the camera picks them up from, and the pictures.",
               docs_url=API_PREFIX + "/docs", redoc_url=API_PREFIX + "/redoc", openapi_url=API_PREFIX + "/openapi.json")
 api = APIRouter(prefix=API_PREFIX)
@@ -235,6 +261,27 @@ def get_picture(task_id: uuid.UUID, marks: bool = Query(True, description="draw 
     return Response(data, media_type="image/jpeg")
 
 
+@mcp.tool(name="get_course_correction", structured_output=True)
+async def get_course_correction(context_and_instructions: str, course_target: str) -> course.CourseCorrection:
+    """Takes a fresh picture with the boat's forward camera (red marks drawn on it at -25°, 0°
+    and +25° from the bow) and asks a vision model how many degrees to turn so the boat heads
+    for the course target. Takes about 10-15 seconds; gives up after 30.
+
+    context_and_instructions: the situation and how to judge it (e.g. "on a lake, keep clear of
+        the shore", "steer for the middle of the gap between the two buoys")
+    course_target: what to head for (e.g. "the red buoy", "the dock with the white boathouse")
+
+    Returns course_correction in degrees (positive = turn right / starboard, negative = left /
+    port), confidence from 0 to 1, a comment explaining it, and the picture task's id.
+    """
+    try:
+        return await course.get_course_correction(store, PictureParams().model_dump(mode="json"),
+                                                  context_and_instructions, course_target)
+    except course.CourseTimeout as e:
+        raise ToolError(str(e))
+
+
 app.include_router(api)
+app.mount(API_PREFIX, mcp_app)  # /api/mcp; after the router, so the API's own paths come first
 # Last, so it only gets what the API doesn't answer.
 app.mount("/", StaticFiles(directory=Path(__file__).resolve().parent / "static", html=True), name="web")

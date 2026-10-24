@@ -69,6 +69,24 @@
   .viewer dl { display: grid; grid-template-columns: auto 1fr; gap: 3px 10px; margin: 0 0 12px; }
   .viewer dt { color: var(--muted); }
   .viewer dd { margin: 0; word-break: break-all; }
+  section.wide { grid-column: 1 / -1; }
+  .course { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1.2fr); gap: 16px; }
+  @media (max-width: 800px) { .course { grid-template-columns: 1fr; } }
+  .course textarea { font: inherit; color: inherit; background: var(--bg); border: 1px solid var(--line);
+                     border-radius: 5px; padding: 6px 8px; width: 100%; resize: vertical; margin: 4px 0 10px; }
+  .course .field { font-weight: 600; font-size: 13px; }
+  .course .field small { font-weight: 400; color: var(--muted); }
+  #course-status { font-size: 13px; }
+  #course-status.error { color: var(--error); }
+  .answer { border: 1px solid var(--line); border-radius: 8px; background: var(--bg); padding: 12px; min-height: 120px; }
+  .answer .turn { display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap; }
+  .answer .degrees { font-size: 34px; font-weight: 700; line-height: 1.1; font-variant-numeric: tabular-nums; }
+  .answer .direction { color: var(--muted); }
+  .meter { height: 8px; border-radius: 4px; background: var(--line); overflow: hidden; margin: 4px 0 10px; }
+  .meter div { height: 100%; background: var(--accent); }
+  .answer .comment { margin: 0 0 10px; }
+  .answer img { max-width: 100%; max-height: 320px; display: block; border-radius: 6px; cursor: pointer; }
+  .answer pre { font-size: 11px; white-space: pre-wrap; word-break: break-word; margin: 6px 0 0; }
 </style>
 </head>
 <body>
@@ -77,6 +95,28 @@
   <span class="muted">order pictures, see what the camera took · <a href="api/docs">API</a></span>
 </header>
 <main>
+  <section class="wide">
+    <h2>Course correction <span class="muted" style="font-weight:400;font-size:12px">MCP tool get_course_correction · api/mcp</span></h2>
+    <div class="course">
+      <form id="course">
+        <label class="field" for="course-context" style="display:block">Context and instructions
+          <small>the situation and how to judge it</small></label>
+        <textarea id="course-context" name="context_and_instructions" rows="4"
+                  placeholder="e.g. On a small lake, keep clear of the reeds on the left."></textarea>
+        <label class="field" for="course-target" style="display:block">Course target
+          <small>what to head for</small></label>
+        <textarea id="course-target" name="course_target" rows="2" required
+                  placeholder="e.g. the red buoy"></textarea>
+        <div class="row">
+          <button type="submit" class="primary">Get course correction</button>
+          <span id="course-status" class="muted"></span>
+        </div>
+      </form>
+      <div id="course-answer" class="answer">
+        <span class="muted">Takes a fresh picture and asks the model; about 10-15 s, gives up after 30.</span>
+      </div>
+    </div>
+  </section>
   <section>
     <h2>New picture</h2>
     <form id="order">
@@ -285,6 +325,86 @@ function openViewer(task) {
   $("viewer").showModal();
 }
 
+// ---- course correction (through the MCP endpoint, as an MCP client would) -----------------
+
+let mcpRequest = 0;
+
+async function mcpTool(name, args) {
+  const r = await fetch(API + "/mcp", {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "Accept": "application/json, text/event-stream" },
+    body: JSON.stringify({ jsonrpc: "2.0", id: ++mcpRequest, method: "tools/call", params: { name, arguments: args } }),
+  });
+  if (!r.ok) throw new Error(r.status + ": " + (await r.text()));
+  const reply = await r.json();
+  if (reply.error) throw new Error(reply.error.message);
+  return reply.result;
+}
+
+function remember(key, value) {
+  try { localStorage.setItem(key, value); } catch (e) {}
+}
+
+function recall(key) {
+  try { return localStorage.getItem(key) || ""; } catch (e) { return ""; }
+}
+
+function showAnswer(result, seconds) {
+  const box = $("course-answer");
+  const raw = el("details", {}, el("summary", { className: "muted", textContent: "MCP response" }),
+                 el("pre", { textContent: JSON.stringify(result, null, 2) }));
+  const out = result.structuredContent;
+  if (result.isError || !out) {
+    const text = (result.content || []).map((c) => c.text).join("\n") || "no answer";
+    $("course-status").textContent = `failed after ${seconds} s`;
+    $("course-status").className = "error";
+    box.replaceChildren(el("p", { className: "comment", textContent: text, style: "color: var(--error)" }), raw);
+    return;
+  }
+  $("course-status").textContent = `answered in ${seconds} s`;
+  $("course-status").className = "muted";
+  const degrees = out.course_correction;
+  const direction = degrees > 0 ? "turn right (starboard)" : degrees < 0 ? "turn left (port)" : "keep the course";
+  const confidence = Math.round(out.confidence * 100);
+  const picture = el("img", { src: `${API}/picture-tasks/${out.task_id}/picture`, alt: "the picture the answer is based on",
+                              title: "taken " + when(out.picture_taken_at) });
+  picture.addEventListener("click", async () => openViewer(await api("/picture-tasks/" + out.task_id)));
+  box.replaceChildren(
+    el("div", { className: "turn" },
+       el("span", { className: "degrees", textContent: (degrees > 0 ? "+" : "") + degrees + "°" }),
+       el("span", { className: "direction", textContent: direction })),
+    el("div", { className: "muted", textContent: `confidence ${confidence}%` }),
+    el("div", { className: "meter" }, el("div", { style: `width: ${confidence}%` })),
+    el("p", { className: "comment", textContent: out.comment }),
+    picture,
+    raw);
+}
+
+async function courseCorrection(event) {
+  event.preventDefault();
+  const form = $("course");
+  const button = event.submitter;
+  const args = { context_and_instructions: form.elements.context_and_instructions.value.trim(),
+                 course_target: form.elements.course_target.value.trim() };
+  remember("course_context", args.context_and_instructions);
+  remember("course_target", args.course_target);
+  button.disabled = true;
+  const started = Date.now();
+  const seconds = () => ((Date.now() - started) / 1000).toFixed(1);
+  $("course-status").className = "muted";
+  const tick = setInterval(() => { $("course-status").textContent = `taking a picture and asking the model… ${seconds()} s`; }, 100);
+  try {
+    showAnswer(await mcpTool("get_course_correction", args), seconds());
+  } catch (e) {
+    showAnswer({ isError: true, content: [{ type: "text", text: "Could not call the tool: " + e.message }] }, seconds());
+  } finally {
+    clearInterval(tick);
+    button.disabled = false;
+    shown = "";
+    loadTasks();  // the picture it took shows up in the requests
+  }
+}
+
 async function start() {
   try {
     const [openapi, defs] = await Promise.all([api("/openapi.json"), api("/picture-defaults")]);
@@ -295,6 +415,9 @@ async function start() {
     say("Could not reach the service: " + e.message, true);
   }
   $("order").addEventListener("submit", order);
+  $("course").addEventListener("submit", courseCorrection);
+  $("course-context").value = recall("course_context");
+  $("course-target").value = recall("course_target");
   $("reset").addEventListener("click", () => setValues(defaults));
   $("filter").addEventListener("change", () => { shown = ""; loadTasks(); });
   $("refresh").addEventListener("click", () => { shown = ""; loadTasks(); });

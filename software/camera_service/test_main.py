@@ -6,6 +6,7 @@ import io
 import os
 import tempfile
 import threading
+import time
 import uuid
 from datetime import datetime, timedelta, timezone
 
@@ -28,6 +29,7 @@ else:
 from fastapi.testclient import TestClient  # noqa: E402
 
 import main  # noqa: E402
+import course  # noqa: E402
 import marks  # noqa: E402
 
 
@@ -234,3 +236,120 @@ def test_angle_marks_land_where_the_clock_calibration_put_them():
     # side of the 6; the model puts +-25 deg a quarter of the width either side of the centre.
     assert abs(marks.x_of(0, 2048) - 1024) < 1
     assert abs(marks.x_of(-25, 2048) - 512) < 5 and abs(marks.x_of(25, 2048) - 1536) < 5
+
+
+# ---- MCP: get_course_correction (a fake camera and a fake model) ----------------------------
+
+MCP_HEADERS = {"Accept": "application/json, text/event-stream", "Content-Type": "application/json"}
+
+
+@pytest.fixture(scope="module")
+def mcp_client():
+    with TestClient(main.app) as c:  # runs the lifespan, which the MCP session manager needs
+        yield c
+
+
+def mcp_call(c, method, params, request_id=1):
+    r = c.post("/api/mcp", headers=MCP_HEADERS, json={"jsonrpc": "2.0", "id": request_id, "method": method, "params": params})
+    assert r.status_code == 200, r.text
+    return r.json()["result"]
+
+
+def fake_camera(stop):
+    """Takes whatever task is pending and uploads a picture for it, like the XIAO does."""
+    while not stop.is_set():
+        task = main.store.claim_next("fake-camera")
+        if task:
+            main.store.complete(task["id"], utc_iso(), JPEG)
+        stop.wait(0.05)
+
+
+def test_mcp_lists_the_tool(mcp_client):
+    mcp_call(mcp_client, "initialize", {"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "t", "version": "1"}})
+    tools = {t["name"]: t for t in mcp_call(mcp_client, "tools/list", {})["tools"]}
+    tool = tools["get_course_correction"]
+    assert set(tool["inputSchema"]["required"]) == {"context_and_instructions", "course_target"}
+    assert {"course_correction", "confidence", "comment"} <= set(tool["outputSchema"]["properties"])
+
+
+def test_get_course_correction_takes_a_picture_and_asks_the_model(mcp_client, monkeypatch):
+    seen = {}
+
+    def model(jpeg, context, target, timeout_s=None):
+        seen.update(jpeg=jpeg, context=context, target=target)
+        return {"course_correction": -12.5, "confidence": 1.4, "comment": "the buoy is left of 0°"}
+
+    monkeypatch.setattr(course, "ask_model", model)
+    drain()
+    stop = threading.Event()
+    camera = threading.Thread(target=fake_camera, args=(stop,))
+    camera.start()
+    try:
+        result = mcp_call(mcp_client, "tools/call", {"name": "get_course_correction", "arguments": {
+            "context_and_instructions": "on a pond", "course_target": "the red buoy"}})
+    finally:
+        stop.set()
+        camera.join()
+    assert not result.get("isError"), result
+    out = result["structuredContent"]
+    assert out["course_correction"] == -12.5 and out["confidence"] == 1.0  # clamped to 0..1
+    assert out["comment"] == "the buoy is left of 0°" and out["picture_taken_at"]
+    task = client.get("/picture-tasks/" + out["task_id"]).json()
+    assert task["status"] == "done" and task["requested_by"] == course.REQUESTED_BY and task["camera"] == "fake-camera"
+    assert seen["context"] == "on a pond" and seen["target"] == "the red buoy"
+    image = Image.open(io.BytesIO(seen["jpeg"])).convert("RGB")  # the model got the marked picture
+    r, g, b = image.getpixel((round(320 - 640 * marks.BOX_W / 2), round(480 * marks.CENTER_Y)))
+    assert r > 150 and g < 80 and b < 80, (r, g, b)
+
+
+def test_get_course_correction_reports_a_camera_that_does_not_answer(mcp_client, monkeypatch):
+    monkeypatch.setattr(course, "TOOL_TIMEOUT_S", 0.5)
+    monkeypatch.setattr(course, "ask_model", lambda *a: pytest.fail("the model shouldn't be asked"))
+    drain()
+    result = mcp_call(mcp_client, "tools/call", {"name": "get_course_correction", "arguments": {
+        "context_and_instructions": "", "course_target": "anything"}})
+    assert result["isError"] and "the camera didn't deliver" in result["content"][0]["text"]
+    drain()  # the order it left behind
+
+
+def test_get_course_correction_gives_up_on_a_slow_model(mcp_client, monkeypatch):
+    monkeypatch.setattr(course, "TOOL_TIMEOUT_S", 1.0)
+    monkeypatch.setattr(course, "ask_model", lambda *a: time.sleep(5) or {})  # far past the limit
+    drain()
+    stop = threading.Event()
+    camera = threading.Thread(target=fake_camera, args=(stop,))
+    camera.start()
+    try:
+        started = time.monotonic()
+        result = mcp_call(mcp_client, "tools/call", {"name": "get_course_correction", "arguments": {
+            "context_and_instructions": "", "course_target": "anything"}})
+        took = time.monotonic() - started
+    finally:
+        stop.set()
+        camera.join()
+    assert result["isError"] and "the model didn't answer" in result["content"][0]["text"]
+    assert took < 2.5, took  # gave up at the limit, didn't wait for the model
+
+
+def test_ask_model_sends_the_picture_and_reads_the_answer(monkeypatch):
+    sent = {}
+
+    class FakeResponses:
+        def create(self, **request):
+            sent.update(request)
+            return type("Response", (), {"output_text": '{"course_correction": 5, "confidence": 0.5, "comment": "ok"}'})()
+
+    class FakeClient:
+        responses = FakeResponses()
+
+        def with_options(self, **options):
+            sent["options"] = options
+            return self
+
+    monkeypatch.setattr(course, "_client", FakeClient())
+    answer = course.ask_model(JPEG, "context", "target", 12.5)
+    assert answer == {"course_correction": 5, "confidence": 0.5, "comment": "ok"}
+    assert sent["options"] == {"timeout": 12.5, "max_retries": 0}
+    assert sent["text"]["format"]["schema"] == course.RESPONSE_SCHEMA
+    content = sent["input"][0]["content"]
+    assert "target" in content[0]["text"] and content[1]["image_url"].startswith("data:image/jpeg;base64,")
