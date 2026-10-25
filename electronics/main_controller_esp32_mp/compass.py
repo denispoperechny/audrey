@@ -54,7 +54,8 @@ import time
 from machine import UART
 
 from bno08x import (BNO08X, BNO_REPORT_GAME_ROTATION_VECTOR, BNO_REPORT_MAGNETOMETER, BNO_REPORT_ROTATION_VECTOR,
-                    ME_SAVE_DCD_PERIODIC_CDE, REPORT_ACCURACY_STATUS, UART_BAUDRATE)
+                    ME_CALIBRATION_CDE, ME_CALIBRATION_CONFIG_SUBCDE, ME_SAVE_DCD_PERIODIC_CDE,
+                    REPORT_ACCURACY_STATUS, UART_BAUDRATE)
 
 ROTATION_VECTOR_HZ = 10  # sensor's internal update rate
 MAGNETOMETER_HZ = 2  # only read for its calibration accuracy, which changes slowly
@@ -121,7 +122,12 @@ class Compass:
         self.bno.enable_feature(BNO_REPORT_ROTATION_VECTOR, self.rate_hz)
         self.bno.enable_feature(BNO_REPORT_GAME_ROTATION_VECTOR, self.rate_hz)
         self.bno.enable_feature(BNO_REPORT_MAGNETOMETER, MAGNETOMETER_HZ)
-        self.bno.calibration()  # turn on continuous accel/gyro/mag self-calibration
+        # Continuous self-calibration for the accelerometer and magnetometer, but not the gyro
+        # (the driver's calibration() turns on all three). With it on, the gyro yaw drifted on
+        # the water by -1 to +1.5 deg/s, wandering over minutes and back to 0 whenever the boat
+        # was truly still: the chip appears to re-learn the gyro's bias wrongly when it is
+        # never quite still (mission 5). Off, it keeps the gyro calibration it has saved.
+        self.bno._send_ME_cde(ME_CALIBRATION_CDE, [1, 0, 1, ME_CALIBRATION_CONFIG_SUBCDE, 0, 0, 0, 0, 0])
 
     def restart_reports(self):
         """Re-enables the reports without resetting the chip, so it keeps its calibration.

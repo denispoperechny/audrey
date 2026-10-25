@@ -1,0 +1,3 @@
+# Raw logs hold the boat's real GPS positions: kept out of the repo, like missions 2-4. The
+# .placeholder file keeps the folder.
+*.jsonl

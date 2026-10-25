@@ -17,3 +17,5 @@ The intent of this project is to explore capabilities of consumer/hobby grade mo
 2. [GPS precision testing](missions/2_gps_precision_testing/index.md) — GNSS precision, boat speed, time to fix
 3. [Control test](missions/3_control_test/index.md) — dry-land check of the control chain: commands, RC takeover, telemetry
 4. [Waypoint navigation #1](missions/4_waypoint_navigation_1/index.md) — first autonomous runs to three destinations: GPS against a reference, compass accuracy, rudder behaviour
+5. [Waypoint navigation #2](missions/5_waypoint_navigation_2/index.md) — re-test after adjustments driven by Mission 4 (re-integrated compass and rudder trim)
+
