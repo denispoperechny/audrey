@@ -1,5 +1,7 @@
 ## Autonomous vehicle project Audrey
 
+<img src="media/uxv.jpg" alt="Audrey, the tug boat, on the water" width="480">
+
 The intent of this project is to explore capabilities of consumer/hobby grade modern technology and have fun.
 
 ### Chassis
