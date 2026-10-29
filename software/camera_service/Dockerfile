@@ -15,7 +15,7 @@ RUN useradd --create-home --uid 1000 app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY --chown=app:app main.py course.py marks.py store.py store_blob.py .env ./
+COPY --chown=app:app main.py course.py marks.py store.py store_blob.py stream_store.py .env ./
 COPY --chown=app:app static ./static
 USER app
 

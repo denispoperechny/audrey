@@ -28,6 +28,27 @@ Camera:
                                         taken_at is when the picture was taken, ISO 8601 in UTC
                                         (e.g. 2026-10-23T18:05:12.345Z)
 
+Stream (pictures the camera sends on its own, without a task):
+    POST /stream/pictures?taken_at=<UTC time>[&camera=<name>]
+                                        the body is the JPEG itself, as for a task's picture.
+                                        Kept in 10-minute folders, named by when it was taken
+                                        (see stream_store.py). The answer comes once the picture
+                                        is checked and cached; it is stored right after, in the
+                                        background (failures are counted in /health)
+    GET  /stream/pictures               the latest, newest first (?after=<name> for only newer
+                                        ones, ?window=<folder> for one 10-minute folder, ?limit=)
+    GET  /stream/pictures/{name}        one picture, with the navigation marks; ?marks=false: as taken
+    GET  /stream/latest[?since=<UTC time>][&max=<n>]
+                                        the newest picture(s), only those taken after `since`;
+                                        204 if there are none. max=1 (the default): the picture
+                                        itself (marked unless ?marks=false), its name and time in
+                                        the X-Picture-Name / X-Taken-At / X-Camera headers, and an
+                                        ETag (send it back as If-None-Match: 304 if still the
+                                        newest). max>1: the details of up to max, newest first, as
+                                        JSON; fetch each from /stream/pictures/{name}
+    The web page /stream.html shows them as they arrive. The newest 5 are also kept in memory
+    (stream_store.RecentCache), so checking for new ones and fetching them rarely touch storage.
+
 MCP (streamable HTTP, no auth), at /api/mcp:
     get_course_correction(context_and_instructions, course_target)
                                         takes a fresh picture, draws the course marks on it and
@@ -40,9 +61,11 @@ Task ids are GUIDs. Where tasks and pictures are kept is set in .env (see .env.e
                                    (default "camera"), under an optional CAMERA_STORAGE_PREFIX.
                                    Signed in with DefaultAzureCredential: your az login locally,
                                    a managed identity in Azure ("Storage Blob Data Contributor"
-                                   on the container).
-  otherwise                        on the local disk: CAMERA_DB (default ./data/camera_tasks.db)
-                                   and CAMERA_PICTURES (default ./data/pictures)
+                                   on the container). Stream pictures go to container
+                                   CAMERA_STREAM_CONTAINER (default "camera-stream").
+  otherwise                        on the local disk: CAMERA_DB (default ./data/camera_tasks.db),
+                                   CAMERA_PICTURES (default ./data/pictures) and CAMERA_STREAM_DIR
+                                   (default ./data/stream)
 """
 
 import contextlib
@@ -55,7 +78,7 @@ from pathlib import Path
 from typing import Literal, Optional
 
 from dotenv import load_dotenv
-from fastapi import APIRouter, FastAPI, HTTPException, Query, Request, Response
+from fastapi import APIRouter, BackgroundTasks, FastAPI, HTTPException, Query, Request, Response
 from fastapi.staticfiles import StaticFiles
 from mcp.server.mcpserver import MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
@@ -63,6 +86,7 @@ from mcp.server.transport_security import TransportSecuritySettings
 from pydantic import BaseModel, ConfigDict, Field
 
 import course
+import stream_store
 from marks import marked
 from store import LocalTaskStore, now_utc
 
@@ -135,6 +159,14 @@ class Task(BaseModel):
     picture_bytes: Optional[int] = None
 
 
+class StreamPicture(BaseModel):
+    name: str = Field(description="<10-minute folder>/<taken_at>_<suffix>.jpg; fetch it at /api/stream/pictures/<name>")
+    taken_at: str = Field(description="when the camera took it (UTC)")
+    uploaded_at: Optional[str] = Field(None, description="when it arrived here (UTC)")
+    camera: Optional[str] = None
+    bytes: int
+
+
 class NextTask(BaseModel):
     utc_now: str = Field(description="the service's current time, UTC, ISO 8601")
     task: Optional[Task] = Field(description="the task to do, or null if there is none")
@@ -153,8 +185,21 @@ def open_store():
     return LocalTaskStore(str(db), os.environ.get("CAMERA_PICTURES", str(db.parent / "pictures")))
 
 
+STREAM_CACHE_SIZE = 5  # newest stream pictures kept in memory, so the live viewer rarely waits on storage
+
+
+def open_stream_store():
+    if os.environ.get("CAMERA_STORAGE_ACCOUNT_URL"):
+        store = stream_store.BlobStreamStore(os.environ["CAMERA_STORAGE_ACCOUNT_URL"],
+                                             os.environ.get("CAMERA_STREAM_CONTAINER", "camera-stream"))
+    else:
+        store = stream_store.LocalStreamStore(os.environ.get("CAMERA_STREAM_DIR", str(Path(__file__).resolve().parent / "data" / "stream")))
+    return stream_store.RecentCache(store, STREAM_CACHE_SIZE)
+
+
 store = open_store()
-marked_cache = OrderedDict()  # task id -> marked JPEG, most recently used last
+stream = open_stream_store()
+marked_cache = OrderedDict()  # task id or stream picture name -> marked JPEG, most recently used last
 
 mcp = MCPServer("audrey-camera", instructions="Steering help from Audrey's camera: get_course_correction "
                  "takes a fresh picture and says how many degrees to turn towards a target.")
@@ -176,22 +221,22 @@ app = FastAPI(title="Audrey camera service", version="0.2", lifespan=lifespan,
 api = APIRouter(prefix=API_PREFIX)
 
 
-def parse_utc(text):
+def parse_utc(text, field="taken_at"):
     """An ISO 8601 time that says it is UTC ("Z" or "+00:00"), normalised; HTTP 422 otherwise."""
     try:
         when = datetime.fromisoformat(text)
     except ValueError:
-        raise HTTPException(422, "taken_at is not an ISO 8601 time: %r" % text)
+        raise HTTPException(422, "%s is not an ISO 8601 time: %r" % (field, text))
     if when.tzinfo is None or when.utcoffset() != timedelta(0):
-        raise HTTPException(422, "taken_at must be in UTC (end it with Z or +00:00): %r" % text)
+        raise HTTPException(422, "%s must be in UTC (end it with Z or +00:00): %r" % (field, text))
     if when - datetime.now(timezone.utc) > MAX_CLOCK_AHEAD:
-        raise HTTPException(422, "taken_at is in the future: %r (is the camera's clock set?)" % text)
+        raise HTTPException(422, "%s is in the future: %r (is the camera's clock set?)" % (field, text))
     return when.astimezone(timezone.utc).isoformat(timespec="milliseconds")
 
 
 @api.get("/health")
 def health():
-    return {"status": "ok", "utc_now": now_utc()}
+    return {"status": "ok", "utc_now": now_utc(), "stream": stream.counts()}
 
 
 @api.get("/picture-defaults", response_model=PictureParams)
@@ -224,17 +269,43 @@ def next_task(camera: Optional[str] = Query(None, max_length=100, description="t
     return {"utc_now": now_utc(), "task": store.claim_next(camera)}
 
 
+async def jpeg_body(request):
+    """The request body, if it is a JPEG of an acceptable size; HTTP 413 / 415 otherwise."""
+    data = await request.body()
+    if len(data) > MAX_PICTURE_BYTES:
+        raise HTTPException(413, "picture larger than %d bytes" % MAX_PICTURE_BYTES)
+    if not data.startswith(b"\xff\xd8\xff"):
+        raise HTTPException(415, "the body has to be the JPEG itself (Content-Type: image/jpeg)")
+    return data
+
+
+def jpeg_response(key, load, marks):
+    """A picture as a response, with the navigation marks drawn on unless marks is false.
+    load() returns the stored JPEG or None; marked copies are cached under key."""
+    if marks and key in marked_cache:
+        marked_cache.move_to_end(key)
+        return Response(marked_cache[key], media_type="image/jpeg")
+    data = load()
+    if data is None:
+        return None
+    if marks:
+        try:
+            data = marked(data)
+        except OSError:  # a JPEG Pillow can't read: serve it as it came
+            return Response(data, media_type="image/jpeg")
+        marked_cache[key] = data
+        if len(marked_cache) > MARKED_CACHE_SIZE:
+            marked_cache.popitem(last=False)
+    return Response(data, media_type="image/jpeg")
+
+
 @api.post("/picture-tasks/{task_id}/picture", response_model=Task,
           responses={404: {"description": "no such task"}, 409: {"description": "the task isn't waiting for a picture"},
                      413: {"description": "picture too large"}, 415: {"description": "not a JPEG"}})
 async def upload_picture(task_id: uuid.UUID, request: Request,
                          taken_at: str = Query(..., description="when the picture was taken, ISO 8601 UTC")):
     when = parse_utc(taken_at)
-    data = await request.body()
-    if len(data) > MAX_PICTURE_BYTES:
-        raise HTTPException(413, "picture larger than %d bytes" % MAX_PICTURE_BYTES)
-    if not data.startswith(b"\xff\xd8\xff"):
-        raise HTTPException(415, "the body has to be the JPEG itself (Content-Type: image/jpeg)")
+    data = await jpeg_body(request)
     task, problem = store.complete(str(task_id), when, data)
     if task is None:
         raise HTTPException(404 if problem == "not found" else 409, "task %s" % problem)
@@ -244,21 +315,73 @@ async def upload_picture(task_id: uuid.UUID, request: Request,
 @api.get("/picture-tasks/{task_id}/picture", response_class=Response,
          responses={200: {"content": {"image/jpeg": {}}}, 404: {"description": "no such task or no picture yet"}})
 def get_picture(task_id: uuid.UUID, marks: bool = Query(True, description="draw the navigation marks on it")):
-    if marks and task_id in marked_cache:
-        marked_cache.move_to_end(task_id)
-        return Response(marked_cache[task_id], media_type="image/jpeg")
-    data = store.picture(str(task_id))
-    if data is None:
+    response = jpeg_response(task_id, lambda: store.picture(str(task_id)), marks)
+    if response is None:
         raise HTTPException(404, "no picture for this task (yet)")
-    if marks:
-        try:
-            data = marked(data)
-        except OSError:  # a JPEG Pillow can't read: serve it as it came
-            return Response(data, media_type="image/jpeg")
-        marked_cache[task_id] = data
-        if len(marked_cache) > MARKED_CACHE_SIZE:
-            marked_cache.popitem(last=False)
-    return Response(data, media_type="image/jpeg")
+    return response
+
+
+@api.post("/stream/pictures", response_model=StreamPicture, status_code=201,
+          responses={413: {"description": "picture too large"}, 415: {"description": "not a JPEG"}})
+async def push_stream_picture(request: Request, background: BackgroundTasks,
+                              taken_at: str = Query(..., description="when the picture was taken, ISO 8601 UTC"),
+                              camera: Optional[str] = Query(None, max_length=100, description="the camera's name")):
+    """Answers as soon as the picture is checked and cached (the live viewer can show it from
+    then on); it is written to storage after the answer, in a worker thread. A failed write is
+    logged and counted in /health ("stream")."""
+    when = datetime.fromisoformat(parse_utc(taken_at))
+    data = await jpeg_body(request)
+    item = stream.accept(when, data, camera)
+    background.add_task(stream.save, item, data)  # a plain function: run in the thread pool
+    return item
+
+
+@api.get("/stream/pictures", response_model=list[StreamPicture])
+def list_stream_pictures(after: Optional[str] = Query(None, description="only pictures newer than this one (its name)"),
+                         window: Optional[str] = Query(None, description="one 10-minute folder, e.g. 20261028T1450Z"),
+                         limit: int = Query(50, ge=1, le=500)):
+    if after is not None and not stream_store.NAME_RE.match(after):
+        raise HTTPException(422, "after has to be a stream picture's name: %r" % after)
+    if window is not None and not stream_store.WINDOW_RE.match(window):
+        raise HTTPException(422, "window has to be a 10-minute folder like 20261028T1450Z: %r" % window)
+    return stream.list(after, limit, window)
+
+
+@api.get("/stream/latest",
+         responses={200: {"content": {"image/jpeg": {}, "application/json": {}},
+                          "description": "max=1: the newest picture itself; max>1: the newest pictures' details"},
+                    204: {"description": "no picture (newer than since, or in the last hour)"},
+                    304: {"description": "max=1: the newest is still the one named in If-None-Match"}})
+def latest_stream_pictures(request: Request,
+                           since: Optional[str] = Query(None, description="only pictures taken after this time, ISO 8601 UTC"),
+                           max: int = Query(1, ge=1, le=100, description="how many of the newest; 1 returns the picture itself"),
+                           marks: bool = Query(True, description="max=1: draw the navigation marks on it")):
+    after = stream_store.after_time(datetime.fromisoformat(parse_utc(since, "since"))) if since else None
+    items = stream.list(after, max)
+    if not items:
+        return Response(status_code=204)
+    if max > 1:
+        return [StreamPicture(**item) for item in items]
+    item = items[0]
+    etag = '"%s%s"' % (item["name"], "" if marks else ";raw")
+    headers = {"ETag": etag, "Cache-Control": "no-cache", "X-Picture-Name": item["name"], "X-Taken-At": item["taken_at"],
+               "X-Camera": item.get("camera") or ""}
+    if request.headers.get("if-none-match") == etag:
+        return Response(status_code=304, headers=headers)
+    response = jpeg_response(("stream", item["name"]), lambda: stream.picture(item["name"]), marks)
+    if response is None:
+        return Response(status_code=204)
+    response.headers.update(headers)
+    return response
+
+
+@api.get("/stream/pictures/{name:path}", response_class=Response,
+         responses={200: {"content": {"image/jpeg": {}}}, 404: {"description": "no such picture"}})
+def get_stream_picture(name: str, marks: bool = Query(True, description="draw the navigation marks on it")):
+    response = jpeg_response(("stream", name), lambda: stream.picture(name), marks)
+    if response is None:
+        raise HTTPException(404, "no such picture")
+    return response
 
 
 @mcp.tool(name="get_course_correction", structured_output=True)

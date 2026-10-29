@@ -1,0 +1,198 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Audrey live stream</title>
+<style>
+  :root {
+    --bg: #f6f7f9; --panel: #fff; --ink: #1c2330; --muted: #677285; --line: #dde1e8;
+    --accent: #1f6feb; --accent-ink: #fff; --error: #c62828; --live: #1b6e3a;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #12151b; --panel: #1b2029; --ink: #e4e8ef; --muted: #98a2b3; --line: #2c3340;
+      --accent: #4c8dff; --accent-ink: #0b0e13; --error: #ff6b6b; --live: #7fdc9f;
+    }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--ink);
+         font: 14px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif; }
+  header { padding: 14px 16px; border-bottom: 1px solid var(--line); background: var(--panel);
+           display: flex; align-items: baseline; gap: 12px; flex-wrap: wrap; }
+  header h1 { font-size: 18px; margin: 0; }
+  header .muted { font-size: 12px; }
+  a { color: var(--accent); }
+  .muted { color: var(--muted); }
+  main { padding: 16px; max-width: 1400px; margin: 0 auto; display: grid; gap: 12px; }
+  .screen { background: #000; border-radius: 8px; overflow: hidden; aspect-ratio: 16 / 9;
+            display: flex; align-items: center; justify-content: center; position: relative; }
+  .screen img { width: 100%; height: 100%; object-fit: contain; display: block; }
+  .screen .empty { color: #98a2b3; padding: 24px; text-align: center; }
+  .badge { position: absolute; top: 10px; left: 10px; padding: 2px 8px; border-radius: 10px; font-size: 12px;
+           font-weight: 600; background: rgba(0, 0, 0, .6); color: #fff; }
+  .badge.live::before { content: "●  "; color: #4ade80; }
+  .badge.paused::before { content: "❚❚  "; }
+  .badge.stale::before { content: "●  "; color: #fbbf24; }
+  .bar { display: flex; gap: 8px 18px; align-items: center; flex-wrap: wrap; background: var(--panel);
+         border: 1px solid var(--line); border-radius: 8px; padding: 8px 12px; }
+  .bar .value { font-variant-numeric: tabular-nums; font-weight: 600; }
+  .spacer { flex: 1; }
+  button { font: inherit; border: 1px solid var(--line); background: var(--bg); color: inherit;
+           border-radius: 5px; padding: 5px 12px; cursor: pointer; }
+  button.primary { background: var(--accent); color: var(--accent-ink); border-color: var(--accent); font-weight: 600; }
+  label { display: inline-flex; gap: 6px; align-items: center; }
+  #error { color: var(--error); font-size: 13px; min-height: 18px; }
+  .strip { display: grid; grid-template-columns: repeat(auto-fill, minmax(120px, 1fr)); gap: 8px; }
+  .strip button { padding: 0; border-radius: 6px; overflow: hidden; background: #000; position: relative; }
+  .strip button.current { outline: 2px solid var(--accent); outline-offset: 1px; }
+  .strip img { width: 100%; aspect-ratio: 16 / 9; object-fit: cover; display: block; }
+  .strip span { position: absolute; left: 0; right: 0; bottom: 0; font-size: 11px; color: #fff;
+                background: rgba(0, 0, 0, .55); padding: 1px 4px; text-align: left; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Live stream</h1>
+  <span class="muted">pictures the camera sends on its own, newest first · <a href="./">tasks</a> · <a href="api/docs">API</a></span>
+</header>
+<main>
+  <div class="screen">
+    <img id="frame" alt="the latest picture from the camera" hidden>
+    <div id="empty" class="empty">Waiting for the camera…<br><span style="font-size:12px">nothing in the last hour</span></div>
+    <span id="badge" class="badge" hidden></span>
+  </div>
+  <div class="bar">
+    <span>taken <span id="taken" class="value">—</span></span>
+    <span>age <span id="age" class="value">—</span></span>
+    <span>every <span id="rate" class="value">—</span></span>
+    <span class="muted" id="details"></span>
+    <span class="spacer"></span>
+    <label><input type="checkbox" id="marks" checked> course marks</label>
+    <button id="pause" class="primary">Pause</button>
+  </div>
+  <div id="error"></div>
+  <div>
+    <div class="muted" style="margin-bottom:6px">Recent pictures (click one to look at it; Resume to go back to live)</div>
+    <div id="strip" class="strip"></div>
+  </div>
+</main>
+
+<script>
+const API = "api/stream/pictures";
+const LATEST = "api/stream/latest";
+const POLL_MS = 500;
+const KEEP = 24;  // pictures kept in the strip
+const STALE_S = 10;  // older than this, the stream is shown as not live
+
+let pictures = [];  // newest first: {name, taken_at, camera, bytes}
+let shown = null;  // the picture on screen
+let paused = false;
+let polling = false;
+let etag = null;  // of the latest picture we have, sent back as If-None-Match
+let frameUrl = null;  // object URL of the picture on screen, released when replaced
+
+const $ = (id) => document.getElementById(id);
+const el = (tag, props = {}, ...children) => { const e = Object.assign(document.createElement(tag), props); e.append(...children); return e; };
+const marksParam = () => ($("marks").checked ? "" : "?marks=false");
+const clock = (iso) => new Date(iso).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit", hourCycle: "h23" });
+
+function display(p, src, isObjectUrl) {
+  // Swap only once the new picture has loaded, so the screen never goes blank in between.
+  const next = new Image();
+  next.onload = () => {
+    $("frame").src = src;
+    if (frameUrl) URL.revokeObjectURL(frameUrl);
+    frameUrl = isObjectUrl ? src : null;
+    $("frame").hidden = false;
+    $("empty").hidden = true;
+    shown = p;
+    $("taken").textContent = clock(p.taken_at) + "." + String(new Date(p.taken_at).getMilliseconds()).padStart(3, "0");
+    $("details").textContent = [p.camera, p.bytes ? (p.bytes / 1024).toFixed(0) + " KB" : ""].filter(Boolean).join(" · ");
+    for (const b of $("strip").children) b.classList.toggle("current", b.dataset.name === p.name);
+    update();
+  };
+  next.src = src;
+}
+
+function showFromStore(p) {  // a picture from the strip
+  display(p, `${API}/${p.name}${marksParam()}`, false);
+}
+
+function drawStrip() {
+  $("strip").replaceChildren(...pictures.map((p) => {
+    const b = el("button", { title: p.name }, el("img", { src: `${API}/${p.name}?marks=false`, loading: "lazy", alt: "" }),
+                 el("span", { textContent: clock(p.taken_at) }));
+    b.dataset.name = p.name;
+    b.classList.toggle("current", shown && shown.name === p.name);
+    b.addEventListener("click", () => { setPaused(true); showFromStore(p); });
+    return b;
+  }));
+}
+
+function update() {
+  const badge = $("badge");
+  badge.hidden = !shown;
+  if (!shown) return;
+  const age = (Date.now() - new Date(shown.taken_at)) / 1000;
+  $("age").textContent = age < 120 ? age.toFixed(1) + " s" : Math.round(age / 60) + " min";
+  // Time between pictures: the median gap among the recent ones.
+  const times = pictures.map((p) => new Date(p.taken_at).getTime()).filter((t) => Date.now() - t < 30000);
+  const gaps = times.slice(1).map((t, i) => (times[i] - t) / 1000).sort((x, y) => x - y);
+  $("rate").textContent = gaps.length ? gaps[Math.floor(gaps.length / 2)].toFixed(1) + " s" : "—";
+  badge.className = "badge " + (paused ? "paused" : age > STALE_S ? "stale" : "live");
+  badge.textContent = paused ? "paused" : age > STALE_S ? "no new pictures" : "live";
+}
+
+async function poll() {
+  // One request: the newest picture itself, or 304 if it is still the one we have.
+  if (polling) return;
+  polling = true;
+  try {
+    const r = await fetch(LATEST + marksParam(), { cache: "no-store", headers: etag ? { "If-None-Match": etag } : {} });
+    $("error").textContent = "";
+    if (r.status === 304 || r.status === 204) return;
+    if (!r.ok) throw new Error(r.status + " " + r.statusText);
+    const blob = await r.blob();
+    etag = r.headers.get("ETag");
+    const p = { name: r.headers.get("X-Picture-Name"), taken_at: r.headers.get("X-Taken-At"),
+                camera: r.headers.get("X-Camera") || null, bytes: blob.size };
+    if (!pictures.some((q) => q.name === p.name)) {
+      pictures = [p].concat(pictures).sort((x, y) => (x.name < y.name ? 1 : -1)).slice(0, KEEP);
+      drawStrip();
+    }
+    if (!paused) display(p, URL.createObjectURL(blob), true);
+  } catch (e) {
+    $("error").textContent = "Could not reach the service: " + e.message;
+  } finally {
+    polling = false;
+  }
+}
+
+async function fillStrip() {  // once, at the start: the recent pictures from storage
+  try {
+    const r = await fetch(`${API}?limit=${KEEP}`);
+    if (r.ok) {
+      const known = new Set(pictures.map((p) => p.name));
+      pictures = pictures.concat((await r.json()).filter((p) => !known.has(p.name))).slice(0, KEEP);
+      drawStrip();
+    }
+  } catch (e) {}
+}
+
+function setPaused(value) {
+  paused = value;
+  $("pause").textContent = paused ? "Resume" : "Pause";
+  if (!paused) { etag = null; poll(); }  // back to live: fetch the newest again
+  update();
+}
+
+$("pause").addEventListener("click", () => setPaused(!paused));
+$("marks").addEventListener("change", () => { etag = null; if (paused && shown) showFromStore(shown); else poll(); });
+fillStrip();
+poll();
+setInterval(() => { if (!document.hidden && !paused) poll(); }, POLL_MS);
+setInterval(update, 500);
+</script>
+</body>
+</html>
