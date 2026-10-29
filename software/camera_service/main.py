@@ -51,10 +51,10 @@ Stream (pictures the camera sends on its own, without a task):
 
 MCP (streamable HTTP, no auth), at /api/mcp:
     get_course_correction(context_and_instructions, course_target)
-                                        takes a fresh picture, draws the course marks on it and
-                                        asks the Foundry model which way to turn (see course.py):
-                                        course_correction (degrees, + = right), confidence (0-1),
-                                        comment
+                                        takes the latest streamed picture, draws the course marks
+                                        on it and asks the Foundry model which way to turn (see
+                                        course.py): course_correction (degrees, + = right),
+                                        confidence (0-1), comment, the picture and its age
 
 Task ids are GUIDs. Where tasks and pictures are kept is set in .env (see .env.example):
   CAMERA_STORAGE_ACCOUNT_URL set   in that Azure storage account: container CAMERA_STORAGE_CONTAINER
@@ -386,21 +386,21 @@ def get_stream_picture(name: str, marks: bool = Query(True, description="draw th
 
 @mcp.tool(name="get_course_correction", structured_output=True)
 async def get_course_correction(context_and_instructions: str, course_target: str) -> course.CourseCorrection:
-    """Takes a fresh picture with the boat's forward camera (red marks drawn on it at -25°, 0°
-    and +25° from the bow) and asks a vision model how many degrees to turn so the boat heads
-    for the course target. Takes about 10-15 seconds; gives up after 30.
+    """Takes the latest picture streamed by the boat's forward camera (red marks drawn on it at
+    -25°, 0° and +25° from the bow) and asks a vision model how many degrees to turn so the boat
+    heads for the course target. Takes a few seconds (the model); gives up after 30.
 
     context_and_instructions: the situation and how to judge it (e.g. "on a lake, keep clear of
         the shore", "steer for the middle of the gap between the two buoys")
     course_target: what to head for (e.g. "the red buoy", "the dock with the white boathouse")
 
     Returns course_correction in degrees (positive = turn right / starboard, negative = left /
-    port), confidence from 0 to 1, a comment explaining it, and the picture task's id.
+    port), confidence from 0 to 1, a comment explaining it, and the picture it used with how old
+    it was (picture_age_s) when the model looked at it.
     """
     try:
-        return await course.get_course_correction(store, PictureParams().model_dump(mode="json"),
-                                                  context_and_instructions, course_target)
-    except course.CourseTimeout as e:
+        return await course.get_course_correction(stream, context_and_instructions, course_target)
+    except course.CourseError as e:
         raise ToolError(str(e))
 
 

@@ -1,11 +1,12 @@
-"""Course correction from a fresh camera picture: the MCP tool get_course_correction.
+"""Course correction from the camera's latest picture: the MCP tool get_course_correction.
 
-    1. orders a picture (the default parameters) and waits for the camera to deliver it
+    1. takes the newest picture the camera streamed (POST /api/stream/pictures; the service
+       keeps the latest few in memory), and notes how old it is
     2. draws the course marks on it (marks.py: red boxes at -25°, 0° and +25°)
     3. shows it to a vision model in Azure AI Foundry with the caller's context, instructions
        and course target, and asks how many degrees to turn
-All of it within TOOL_TIMEOUT_S; past that the tool gives up and says which step was still
-going (a picture order left pending is taken by the camera when it next asks).
+The model has TOOL_TIMEOUT_S to answer; past that the tool gives up. With no streamed picture
+in the last hour it fails straight away.
 
 The model is an Azure OpenAI deployment (FOUNDRY_OPENAI_URL, FOUNDRY_MODEL in .env), reached
 with DefaultAzureCredential: your az login locally, the container app's managed identity in
@@ -15,7 +16,7 @@ Azure (role "Cognitive Services OpenAI User" on the Foundry resource; key access
 import base64
 import json
 import os
-import time
+from datetime import datetime, timezone
 
 import anyio
 from pydantic import BaseModel, Field
@@ -24,9 +25,7 @@ import marks
 
 DEFAULT_OPENAI_URL = "https://temp-test-01-resource.openai.azure.com/openai/v1/"
 DEFAULT_MODEL = "gpt-6-astra"
-TOOL_TIMEOUT_S = 30  # the whole call: picture and model; no answer by then is an error
-CAMERA_POLL_S = 0.5
-REQUESTED_BY = "mcp get_course_correction"
+TOOL_TIMEOUT_S = 30  # for the model's answer; none by then is an error
 
 INSTRUCTIONS = """You steer Audrey, a small autonomous boat, from pictures taken by its camera.
 The camera is fixed on the boat and looks straight ahead over the bow. Red boxes are drawn on
@@ -61,28 +60,18 @@ class CourseCorrection(BaseModel):
     course_correction: float = Field(description="degrees to turn: positive = right (starboard), negative = left (port)")
     confidence: float = Field(ge=0, le=1, description="0 to 1, how sure the model is")
     comment: str = Field(description="what the model saw and why it suggests this correction")
-    task_id: str = Field(description="the picture task; its picture: GET /api/picture-tasks/<task_id>/picture")
+    picture: str = Field(description="the streamed picture it is based on: GET /api/stream/pictures/<picture>")
     picture_taken_at: str = Field(description="when the camera took the picture (UTC)")
+    picture_age_s: float = Field(description="how old the picture was when it was given to the model, in seconds")
 
 
-class CourseTimeout(Exception):
-    pass
+class CourseError(Exception):
+    """The tool can't answer: no picture, or no answer from the model in time."""
 
 
 def in_thread(function, *args):
     """Runs a blocking call in a worker thread; a timeout doesn't wait for it to return."""
     return anyio.to_thread.run_sync(lambda: function(*args), abandon_on_cancel=True)
-
-
-async def take_picture(store, params, progress):
-    """Orders a picture with these parameters and waits for it. Returns the done task."""
-    task = await in_thread(store.create, params, REQUESTED_BY)
-    progress["task_id"] = task["id"]
-    while True:
-        current = await in_thread(store.get, task["id"])
-        if current and current["status"] == "done":
-            return current
-        await anyio.sleep(CAMERA_POLL_S)
 
 
 _client = None
@@ -117,24 +106,24 @@ def ask_model(jpeg, context_and_instructions, course_target, timeout_s=TOOL_TIME
     return json.loads(response.output_text)
 
 
-async def get_course_correction(store, params, context_and_instructions, course_target):
-    progress = {"step": "the camera didn't deliver the picture", "task_id": None}
-    deadline = time.monotonic() + TOOL_TIMEOUT_S
+async def get_course_correction(stream, context_and_instructions, course_target):
+    """stream: the service's stream store (stream_store.RecentCache)."""
+    newest = await in_thread(stream.list, None, 1)
+    jpeg = await in_thread(stream.picture, newest[0]["name"]) if newest else None
+    if jpeg is None:
+        raise CourseError("no picture from the camera in the last hour: is it streaming?")
+    item = newest[0]
+    age_s = (datetime.now(timezone.utc) - datetime.fromisoformat(item["taken_at"])).total_seconds()
     try:
         with anyio.fail_after(TOOL_TIMEOUT_S):
-            task = await take_picture(store, params, progress)
-            jpeg = await in_thread(store.picture, task["id"])
-            progress["step"] = "the model didn't answer"
-            answer = await in_thread(ask_model, marks.marked(jpeg), context_and_instructions, course_target,
-                                     max(1.0, deadline - time.monotonic()))
+            answer = await in_thread(ask_model, marks.marked(jpeg), context_and_instructions, course_target, TOOL_TIMEOUT_S)
     except TimeoutError:
-        raise CourseTimeout("no answer within %g s: %s (picture task %s)%s" % (
-            TOOL_TIMEOUT_S, progress["step"], progress["task_id"],
-            "; is the camera on and online?" if progress["step"].startswith("the camera") else ""))
+        raise CourseError("the model didn't answer within %g s (picture %s)" % (TOOL_TIMEOUT_S, item["name"]))
     return CourseCorrection(
         course_correction=float(answer["course_correction"]),
         confidence=min(1.0, max(0.0, float(answer["confidence"]))),
         comment=answer["comment"],
-        task_id=task["id"],
-        picture_taken_at=task["taken_at"],
+        picture=item["name"],
+        picture_taken_at=item["taken_at"],
+        picture_age_s=round(age_s, 2),
     )
