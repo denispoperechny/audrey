@@ -1,0 +1,11 @@
+.venv
+__pycache__
+.pytest_cache
+.env
+*.pem
+!mqtt_ca.pem
+data
+test_*.py
+*/test_*.py
+conftest.py
+requirements-dev.txt

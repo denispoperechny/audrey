@@ -1,0 +1,28 @@
+# Runs the processes side by side (see supervisord.conf)
+supervisor>=4.2
+
+# The LLM in Azure AI Foundry (Entra ID sign-in, as the camera service does)
+openai>=3.30
+azure-identity>=1.17
+
+# The boat: telemetry and commands over the MQTT broker
+paho-mqtt>=2.1
+
+# The camera service: latest picture, course marks (HTTP API and MCP)
+httpx>=0.27
+mcp>=1.24,<2  # langchain-mcp-adapters (the captain) needs mcp 1.x; boat_mcp uses its FastMCP
+
+# Serving the MCP tools (boat_mcp) and the mission UI (mission_ui) over HTTP
+uvicorn>=0.30
+fastapi>=0.115
+
+# The captain: a LangChain deep agent with the boat's MCP tools
+deepagents>=0.7
+langchain-openai>=1.7
+langchain-mcp-adapters>=0.3
+
+# Traces to the storage account (tracing.py)
+azure-storage-blob>=12.20
+
+# Settings from .env
+python-dotenv>=1.0
