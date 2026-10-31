@@ -19,9 +19,19 @@
 //   arduino-cli compile -b esp32:esp32:XIAO_ESP32S3:PSRAM=opi,CDCOnBoot=default src
 //   arduino-cli upload -b esp32:esp32:XIAO_ESP32S3:PSRAM=opi,CDCOnBoot=default -p <port> src
 // Log on the USB serial port at 115200.
+//
+// Two safety nets restart the board (it streams again about 5 s later) if it gets stuck:
+//   - the task watchdog: the main loop hasn't come round for WATCHDOG_S (something hung inside
+//     the WiFi, HTTP or camera code; the longest normal wait is a 20 s WiFi attempt)
+//   - no WiFi for WIFI_RESTART_AFTER_MS in a row (the WiFi driver can get into a state only a
+//     restart clears)
+// Upload failures alone never restart it: if the service is down, a restart wouldn't help.
+// The reason for the last restart is logged at start.
 
 #include <HTTPClient.h>
 #include <WiFi.h>
+#include <esp_system.h>
+#include <esp_task_wdt.h>
 #include <esp_timer.h>
 #include <sys/time.h>
 #include <time.h>
@@ -31,6 +41,8 @@
 
 const unsigned long MIN_INTERVAL_MS = 1000;  // between the starts of two shots
 const unsigned long WIFI_TIMEOUT_MS = 20000;  // give up one connection attempt after this, then retry
+const unsigned long WIFI_RESTART_AFTER_MS = 180000;  // no WiFi for this long in a row: restart the board
+const uint32_t WATCHDOG_S = 60;  // the loop hasn't come round for this long: the watchdog restarts the board
 const int HTTP_TIMEOUT_MS = 10000;
 const time_t CLOCK_VALID_AFTER = 1767225600;  // 2026-01-01: before that, the clock hasn't been set
 const int SETTLE_MS = 1000;  // auto exposure and white balance, once at start (service default)
@@ -45,8 +57,10 @@ const int FRESH_FRAME_TRIES = 3;  // frames dropped at most before sending whate
 const framesize_t FRAME_SIZE = FRAMESIZE_HD;  // 1280 x 720
 const int JPEG_QUALITY = 12;  // lower = better quality, bigger file; 12 (service default 8) roughly halves the
                               // size, so uploads need fewer round trips and are less often held up by a lost packet
-const bool HMIRROR = true;  // relative to the sensor's power-on setting: on this board it needs flipping
-const bool VFLIP = false;
+// Relative to the sensor's power-on setting. The camera is mounted upside down on the boat, so
+// both are the opposite of upright (upright on this board: HMIRROR true, VFLIP false).
+const bool HMIRROR = false;
+const bool VFLIP = true;
 const gainceiling_t GAIN_CEILING = GAINCEILING_32X;
 const bool NIGHT_MODE = false;
 const int AE_LEVEL = 2;
@@ -72,6 +86,7 @@ const int AE_LEVEL = 2;
 WiFiClient tcp;
 HTTPClient http;
 bool camera_ok = false;
+unsigned long wifi_lost_since = 0;  // millis() when WiFi was last seen down (0: it is up)
 bool clock_reported = false;
 int capture_failures = 0;
 
@@ -82,17 +97,41 @@ size_t bytes_total = 0;
 
 // ---- WiFi and clock -------------------------------------------------------------------------
 
+const char *wifi_status_text(wl_status_t status) {
+  switch (status) {
+    case WL_NO_SSID_AVAIL: return "network not found";
+    case WL_CONNECT_FAILED: return "connection refused (password?)";
+    case WL_CONNECTION_LOST: return "connection lost";
+    case WL_DISCONNECTED: return "disconnected";
+    case WL_IDLE_STATUS: return "idle";
+    default: return "other";
+  }
+}
+
 bool wifi_up() {
-  if (WiFi.status() == WL_CONNECTED) return true;
+  if (WiFi.status() == WL_CONNECTED) {
+    wifi_lost_since = 0;
+    return true;
+  }
+  if (wifi_lost_since == 0) wifi_lost_since = millis() | 1;
+  if (millis() - wifi_lost_since > WIFI_RESTART_AFTER_MS) {
+    Serial.printf("WiFi: none for %lu s: restarting the board\n", WIFI_RESTART_AFTER_MS / 1000);
+    Serial.flush();
+    ESP.restart();
+  }
   Serial.printf("WiFi: connecting to %s\n", WIFI_SSID);
   WiFi.disconnect();
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
   unsigned long start = millis();
-  while (WiFi.status() != WL_CONNECTED && millis() - start < WIFI_TIMEOUT_MS) delay(250);
+  while (WiFi.status() != WL_CONNECTED && millis() - start < WIFI_TIMEOUT_MS) {
+    esp_task_wdt_reset();  // waiting here is normal
+    delay(250);
+  }
   if (WiFi.status() != WL_CONNECTED) {
-    Serial.println("WiFi: not connected, will retry");
+    Serial.printf("WiFi: not connected (%s), will retry\n", wifi_status_text(WiFi.status()));
     return false;
   }
+  wifi_lost_since = 0;
   Serial.printf("WiFi: connected, IP %s, RSSI %d dBm\n", WiFi.localIP().toString().c_str(), WiFi.RSSI());
   // (Re)start SNTP now that there is a network: UTC, no daylight saving. It keeps itself in
   // sync from here on (every hour).
@@ -230,10 +269,30 @@ void send_frame() {
   }
 }
 
+const char *reset_reason_text() {
+  switch (esp_reset_reason()) {
+    case ESP_RST_POWERON: return "power on";
+    case ESP_RST_SW: return "restarted by the firmware (e.g. no WiFi for too long)";
+    case ESP_RST_PANIC: return "crash";
+    case ESP_RST_TASK_WDT: return "watchdog: the loop was stuck";
+    case ESP_RST_INT_WDT: return "watchdog: interrupts were stuck";
+    case ESP_RST_WDT: return "watchdog";
+    case ESP_RST_BROWNOUT: return "brownout: the supply voltage dipped";
+    case ESP_RST_USB: return "USB";
+    default: return "other";
+  }
+}
+
 void setup() {
   Serial.begin(115200);
   delay(1500);
   Serial.printf("Audrey streaming camera %s, service %s, PSRAM %u bytes\n", CAMERA_NAME, SERVICE_URL, ESP.getPsramSize());
+  Serial.printf("started after: %s\n", reset_reason_text());
+  // The task watchdog (already running, in restart mode, for core 0's idle task): a longer
+  // timeout, and the loop watched too.
+  esp_task_wdt_config_t watchdog = {WATCHDOG_S * 1000, 1 << 0, true};
+  esp_task_wdt_reconfigure(&watchdog);
+  esp_task_wdt_add(nullptr);
   setenv("TZ", "UTC0", 1);
   tzset();
   WiFi.mode(WIFI_STA);
@@ -244,6 +303,7 @@ void setup() {
 }
 
 void loop() {
+  esp_task_wdt_reset();  // the loop came round
   if (!camera_ok) {
     delay(2000);
     camera_ok = camera_on();
