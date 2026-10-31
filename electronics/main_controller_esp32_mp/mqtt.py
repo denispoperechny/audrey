@@ -11,6 +11,10 @@ get_command(), which just move items in and out of the queues under a lock.
   link.publish({"heading": 251.1})   # queued; sent by the MQTT thread (dict -> JSON)
   cmd = link.get_command()           # (payload bytes, ticks_ms received) or None
 
+Each thread notes the time every time round its loop (alive_ms), so the main loop can tell
+a thread that is stuck inside a call (a TLS connect or a send on a dead socket can block for
+good) or has died: stalled(). It can't be killed, so the controller then resets the board.
+
 Both queues are bounded and drop their oldest item when full: while the broker is
 unreachable, telemetry keeps only the latest messages, and a backlog of commands can't
 grow without limit. Commands are handed over as raw bytes; what they mean (and whether
@@ -92,6 +96,8 @@ class MqttLink:
         self.rx_count = 0
         self.tx_count = 0
         self.errors = 0
+        now = time.ticks_ms()
+        self.alive_ms = {"wifi": now, "mqtt": now}  # each thread's last time round its loop
 
     def start(self):
         # Bring the WiFi driver up here, not in the thread, so it gets its memory before
@@ -109,6 +115,14 @@ class MqttLink:
     def get_command(self):
         """Oldest received command as (payload bytes, ticks_ms received), or None."""
         return self.commands.get()
+
+    def stalled(self, now, limit_ms):
+        """The name of a thread that hasn't come round its loop for limit_ms ("wifi" or
+        "mqtt"), or None."""
+        for name, alive in self.alive_ms.items():
+            if time.ticks_diff(now, alive) > limit_ms:
+                return name
+        return None
 
     def describe(self):
         """One-line status for the console."""
@@ -164,6 +178,7 @@ class MqttLink:
         """Keeps the station connected, reconnecting if the link drops."""
         self.wlan.active(True)
         while True:
+            self.alive_ms["wifi"] = time.ticks_ms()
             try:
                 connected = self._wifi_connect()
             except Exception as e:  # keep the thread alive across any WiFi error
@@ -239,6 +254,7 @@ class MqttLink:
         a WiFi blip doesn't kill the thread."""
         client = None
         while True:
+            self.alive_ms["mqtt"] = time.ticks_ms()
             try:
                 if client is None:
                     if not self.wlan.isconnected():

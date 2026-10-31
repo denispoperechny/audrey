@@ -14,6 +14,7 @@ so a network stall can't hold up the loop.
   bcu_status  1000 ms  read the Pico's status block
   mqtt        1000 ms  handle received commands, queue telemetry
   report      1000 ms  heartbeat LED, garbage collection
+  link_watch  1000 ms  reset the board if the WiFi or MQTT thread is stuck (see below)
 
 The Pico is on the I2C bus at 0x31; the BNO08x compass and the L76K GNSS module each have
 their own UART (pins in BOARD_PINS).
@@ -41,6 +42,12 @@ Resiliency -- this is an autonomous boat, so no single failure may stop the loop
     so the board first holds neutral for BOOT_WINDOW_MS, when Ctrl+C still gets through:
     reset, then run mpremote within that window to upload or remove the flag.
       Enable: mpremote fs touch :production     Disable: mpremote fs rm :production
+  - The WiFi and MQTT threads aren't covered by that watchdog (the loop keeps feeding it while
+    a network call hangs), so the boat would go silent and deaf to commands. If either thread
+    hasn't come round its loop for LINK_STALL_MS (mqtt.py: stalled()), the board commands
+    neutral and resets, in dev mode too; a thread can't be restarted on its own. The reason is
+    kept in a file across the reset and reported in reset_cause. A broker that is merely down
+    doesn't trigger it: the thread keeps retrying, so it keeps coming round.
   - Anything that escapes all of the above (a bug in the loop itself) is caught in
     main.py, which prints the error, commands neutral and resets the chip.
 
@@ -166,6 +173,9 @@ ERROR_LOG_INTERVAL_MS = 5000  # per task, print at most one error line this ofte
 PRODUCTION_FLAG_FILE = "production"
 BOOT_WINDOW_MS = 3000
 WDT_MS = 8000  # longest intentional block is a compass init or calibration save, ~2 s
+LINK_WATCH_PERIOD_MS = 1000
+LINK_STALL_MS = 60000  # longest normal block in a network thread: a WiFi attempt (15 s) or a TLS connect
+RESET_REASON_FILE = "reset_reason"  # why we reset ourselves, read and removed at the next boot
 
 RESET_CAUSES = {
     machine.PWRON_RESET: "power-on",
@@ -211,6 +221,17 @@ def memory_stats():
         "sys_free": sum(region[1] for region in idf),
         "sys_largest": max(region[2] for region in idf),
     }
+
+
+def read_reset_reason():
+    """What watch_link() wrote before resetting the board, once; None if nothing."""
+    try:
+        with open(RESET_REASON_FILE) as f:
+            reason = f.read().strip()
+        os.remove(RESET_REASON_FILE)
+        return reason or None
+    except OSError:
+        return None
 
 
 def file_exists(name):
@@ -269,6 +290,9 @@ class Controller:
     def __init__(self):
         self.boot_ms = time.ticks_ms()
         self.reset_cause = RESET_CAUSES.get(machine.reset_cause(), str(machine.reset_cause()))
+        reason = read_reset_reason()
+        if reason:
+            self.reset_cause += " (%s)" % reason
         self.led = Pin(LED_PIN, Pin.OUT)
 
         self.i2c = make_i2c()
@@ -318,6 +342,7 @@ class Controller:
             Task("bcu_status", BCU_STATUS_PERIOD_MS, self.read_bcu_status),
             Task("mqtt", MQTT_PERIOD_MS, self.exchange_mqtt),
             Task("report", REPORT_PERIOD_MS, self.report),
+            Task("link_watch", LINK_WATCH_PERIOD_MS, self.watch_link),
         ]
 
     # ---- startup helpers ---------------------------------------------------------------
@@ -461,6 +486,26 @@ class Controller:
     def report(self, now):
         self.led.value(not self.led.value())
         gc.collect()  # at a known moment, instead of whenever an allocation triggers it
+
+    def watch_link(self, now):
+        if self.mqtt is None:
+            return
+        stuck = self.mqtt.stalled(now, LINK_STALL_MS)
+        if stuck is None:
+            return
+        reason = "link watchdog: %s thread stuck for %d s" % (stuck, LINK_STALL_MS // 1000)
+        print("%s -- resetting" % reason)
+        try:
+            self.bcu.send(0, 0)  # neutral now; the Pico would also go neutral by itself
+        except Exception:
+            pass
+        try:
+            with open(RESET_REASON_FILE, "w") as f:
+                f.write(reason)
+        except OSError:
+            pass
+        time.sleep_ms(100)  # let the console line out
+        machine.reset()
 
     # ---- helpers ---------------------------------------------------------------------
 
