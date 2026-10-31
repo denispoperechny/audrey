@@ -3,14 +3,17 @@
     GET <CAMERA_SERVICE_URL>/stream/latest?since=<UTC time>   the newest picture taken after that
                                                                time (with the course marks), or 204
 
-CAMERA_SERVICE_URL defaults to the deployed service's /api over plain HTTP.
+CAMERA_SERVICE_URL defaults to the deployed service's /api (https: the service refuses plain http
+for this). The service gives pictures only with its visuals access secret: CAMERA_VISUALS_ACCESS,
+sent in the X-Visuals-Access header. A fetched picture is stored by the service (kept for
+reviewing what mission control looked at).
 """
 
 import os
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
-DEFAULT_URL = "http://camera-service.orangepond-88aa4066.eastus2.azurecontainerapps.io/api"
+DEFAULT_URL = "https://camera-service.orangepond-88aa4066.eastus2.azurecontainerapps.io/api"
 
 
 @dataclass
@@ -26,11 +29,12 @@ def iso(unix):
 
 
 class CameraClient:
-    def __init__(self, base_url=None, timeout_s=3.0):
+    def __init__(self, base_url=None, timeout_s=3.0, visuals_access=None):
         import httpx
 
         self.base_url = (base_url or os.environ.get("CAMERA_SERVICE_URL") or DEFAULT_URL).rstrip("/")
-        self.http = httpx.Client(timeout=timeout_s)
+        secret = visuals_access or os.environ.get("CAMERA_VISUALS_ACCESS") or ""
+        self.http = httpx.Client(timeout=timeout_s, headers={"X-Visuals-Access": secret} if secret else {})
 
     def picture_between(self, start, end):
         """The newest picture taken from `start` on, if it was taken by `end` (unix seconds); None

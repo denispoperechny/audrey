@@ -1,9 +1,10 @@
 # Audrey camera service (FastAPI) on port 8000.
 #
-#   az acr build -r audreyacr -t camera-service:latest --platform linux/amd64 .
+#   ./deploy.sh        builds it in the registry and updates the container app
 #
-# The image includes .env, which only says where the storage is (no secrets): in Azure the
-# container app signs in to storage with its managed identity.
+# .env isn't in the image: deploy.sh sets its values on the container app (the visuals access
+# secret as a container app secret). In Azure the app signs in to storage and Foundry with its
+# managed identity.
 FROM python:3.13-slim
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
@@ -15,7 +16,7 @@ RUN useradd --create-home --uid 1000 app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY --chown=app:app main.py course.py marks.py store.py store_blob.py stream_store.py .env ./
+COPY --chown=app:app main.py course.py marks.py store.py store_blob.py stream_store.py ./
 COPY --chown=app:app static ./static
 USER app
 

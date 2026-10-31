@@ -16,6 +16,7 @@ Azure (role "Cognitive Services OpenAI User" on the Foundry resource; key access
 import base64
 import json
 import os
+import threading
 from datetime import datetime, timezone
 
 import anyio
@@ -113,6 +114,9 @@ async def get_course_correction(stream, context_and_instructions, course_target)
     if jpeg is None:
         raise CourseError("no picture from the camera in the last hour: is it streaming?")
     item = newest[0]
+    kept = stream.keep(item["name"])  # the picture a decision was based on: stored, meanwhile
+    if kept:
+        threading.Thread(target=stream.save, args=kept, daemon=True).start()
     age_s = (datetime.now(timezone.utc) - datetime.fromisoformat(item["taken_at"])).total_seconds()
     try:
         with anyio.fail_after(TOOL_TIMEOUT_S):

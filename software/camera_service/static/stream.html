@@ -4,6 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Audrey live stream</title>
+<script src="visuals.js"></script>
 <style>
   :root {
     --bg: #f6f7f9; --panel: #fff; --ink: #1c2330; --muted: #677285; --line: #dde1e8;
@@ -28,6 +29,7 @@
   .screen { background: #000; border-radius: 8px; overflow: hidden; aspect-ratio: 16 / 9;
             display: flex; align-items: center; justify-content: center; position: relative; }
   .screen img { width: 100%; height: 100%; object-fit: contain; display: block; }
+  .screen img[hidden] { display: none; }
   .screen .empty { color: #98a2b3; padding: 24px; text-align: center; }
   .badge { position: absolute; top: 10px; left: 10px; padding: 2px 8px; border-radius: 10px; font-size: 12px;
            font-weight: 600; background: rgba(0, 0, 0, .6); color: #fff; }
@@ -94,7 +96,8 @@ let frameUrl = null;  // object URL of the picture on screen, released when repl
 
 const $ = (id) => document.getElementById(id);
 const el = (tag, props = {}, ...children) => { const e = Object.assign(document.createElement(tag), props); e.append(...children); return e; };
-const marksParam = () => ($("marks").checked ? "" : "?marks=false");
+// fetch_no_store: watching the stream doesn't store its pictures (fetching them otherwise does)
+const marksParam = () => ($("marks").checked ? "?fetch_no_store=true" : "?marks=false&fetch_no_store=true");
 const clock = (iso) => new Date(iso).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit", hourCycle: "h23" });
 
 function display(p, src, isObjectUrl) {
@@ -116,13 +119,28 @@ function display(p, src, isObjectUrl) {
 }
 
 function showFromStore(p) {  // a picture from the strip
-  display(p, `${API}/${p.name}${marksParam()}`, false);
+  visuals.image(`${API}/${p.name}${marksParam()}`).then((url) => display(p, url, true))
+    .catch((e) => { $("error").textContent = "Could not load the picture: " + e.message; });
+}
+
+const thumbs = new Map();  // name -> Promise of the thumbnail's object URL
+
+function thumbnail(p) {
+  if (!thumbs.has(p.name)) thumbs.set(p.name, visuals.image(`${API}/${p.name}?marks=false&fetch_no_store=true`));
+  return thumbs.get(p.name);
 }
 
 function drawStrip() {
+  for (const [name, url] of thumbs) {  // let go of the ones no longer in the strip
+    if (!pictures.some((p) => p.name === name)) {
+      url.then((u) => URL.revokeObjectURL(u), () => {});
+      thumbs.delete(name);
+    }
+  }
   $("strip").replaceChildren(...pictures.map((p) => {
-    const b = el("button", { title: p.name }, el("img", { src: `${API}/${p.name}?marks=false`, loading: "lazy", alt: "" }),
-                 el("span", { textContent: clock(p.taken_at) }));
+    const img = el("img", { alt: "" });
+    thumbnail(p).then((u) => { img.src = u; }, () => thumbs.delete(p.name));
+    const b = el("button", { title: p.name }, img, el("span", { textContent: clock(p.taken_at) }));
     b.dataset.name = p.name;
     b.classList.toggle("current", shown && shown.name === p.name);
     b.addEventListener("click", () => { setPaused(true); showFromStore(p); });
@@ -149,7 +167,7 @@ async function poll() {
   if (polling) return;
   polling = true;
   try {
-    const r = await fetch(LATEST + marksParam(), { cache: "no-store", headers: etag ? { "If-None-Match": etag } : {} });
+    const r = await visuals.fetch(LATEST + marksParam(), { cache: "no-store", headers: etag ? { "If-None-Match": etag } : {} });
     $("error").textContent = "";
     if (r.status === 304 || r.status === 204) return;
     if (!r.ok) throw new Error(r.status + " " + r.statusText);
@@ -163,7 +181,7 @@ async function poll() {
     }
     if (!paused) display(p, URL.createObjectURL(blob), true);
   } catch (e) {
-    $("error").textContent = "Could not reach the service: " + e.message;
+    $("error").textContent = e.visuals ? e.message : "Could not reach the service: " + e.message;
   } finally {
     polling = false;
   }
@@ -171,7 +189,7 @@ async function poll() {
 
 async function fillStrip() {  // once, at the start: the recent pictures from storage
   try {
-    const r = await fetch(`${API}?limit=${KEEP}`);
+    const r = await visuals.fetch(`${API}?limit=${KEEP}`);
     if (r.ok) {
       const known = new Set(pictures.map((p) => p.name));
       pictures = pictures.concat((await r.json()).filter((p) => !known.has(p.name))).slice(0, KEEP);
@@ -189,6 +207,7 @@ function setPaused(value) {
 
 $("pause").addEventListener("click", () => setPaused(!paused));
 $("marks").addEventListener("change", () => { etag = null; if (paused && shown) showFromStore(shown); else poll(); });
+visuals.onChange(() => { etag = null; fillStrip(); poll(); });  // a new secret: try again
 fillStrip();
 poll();
 setInterval(() => { if (!document.hidden && !paused) poll(); }, POLL_MS);

@@ -4,6 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Audrey camera</title>
+<script src="visuals.js"></script>
 <style>
   :root {
     --bg: #f6f7f9; --panel: #fff; --ink: #1c2330; --muted: #677285; --line: #dde1e8;
@@ -97,7 +98,7 @@ const el = (tag, props = {}, ...children) => {
 let mcpRequest = 0;
 
 async function mcpTool(name, args) {
-  const r = await fetch(API + "/mcp", {
+  const r = await visuals.fetch(API + "/mcp", {
     method: "POST",
     headers: { "Content-Type": "application/json", "Accept": "application/json, text/event-stream" },
     body: JSON.stringify({ jsonrpc: "2.0", id: ++mcpRequest, method: "tools/call", params: { name, arguments: args } }),
@@ -133,10 +134,13 @@ function showAnswer(result, seconds) {
   const degrees = out.course_correction;
   const direction = degrees > 0 ? "turn right (starboard)" : degrees < 0 ? "turn left (port)" : "keep the course";
   const confidence = Math.round(out.confidence * 100);
-  const pictureUrl = `${API}/stream/pictures/${out.picture}`;
-  const picture = el("img", { src: pictureUrl, alt: "the picture the answer is based on",
+  const picture = el("img", { alt: "the picture the answer is based on",
                               title: "taken " + when(out.picture_taken_at) + " (click for full size)" });
-  picture.addEventListener("click", () => window.open(pictureUrl, "_blank"));
+  // Fetched with the visuals secret (an <img src> can't send it); shown from memory.
+  visuals.image(`${API}/stream/pictures/${out.picture}`).then((url) => {
+    picture.src = url;
+    picture.addEventListener("click", () => window.open(url, "_blank"));
+  }).catch(() => { picture.alt = "the picture couldn't be loaded"; });
   const timings = el("p", { className: "muted", style: "margin: 10px 0 0" },
     "Picture: ", el("b", { textContent: out.picture_age_s.toFixed(1) + " s old" }), " when the model looked at it · ",
     "Answer: ", el("b", { textContent: seconds + " s" }), " from pressing the button");

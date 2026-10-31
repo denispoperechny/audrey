@@ -5,3 +5,6 @@ __pycache__/
 data/
 test_main.py
 requirements-dev.txt
+# Settings go to the container app (deploy.sh): the secret mustn't be in the image.
+.env
+*.sh

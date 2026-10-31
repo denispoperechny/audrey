@@ -31,10 +31,12 @@ Camera:
 Stream (pictures the camera sends on its own, without a task):
     POST /stream/pictures?taken_at=<UTC time>[&camera=<name>]
                                         the body is the JPEG itself, as for a task's picture.
-                                        Kept in 10-minute folders, named by when it was taken
-                                        (see stream_store.py). The answer comes once the picture
-                                        is checked and cached; it is stored right after, in the
-                                        background (failures are counted in /health)
+                                        Named by when it was taken and kept in memory (the newest
+                                        5); not stored (CAMERA_STREAM_STORE_ALL=true: every one is)
+    A picture is stored (in 10-minute folders, see stream_store.py; in the background, failures
+    counted in /health) when it is fetched below: by GET /stream/latest with max=1 or GET
+    /stream/pictures/{name}, unless the request says ?fetch_no_store=true (the viewer page
+    does), and by get_course_correction. So storage keeps the pictures something looked at.
     GET  /stream/pictures               the latest, newest first (?after=<name> for only newer
                                         ones, ?window=<folder> for one 10-minute folder, ?limit=)
     GET  /stream/pictures/{name}        one picture, with the navigation marks; ?marks=false: as taken
@@ -46,8 +48,9 @@ Stream (pictures the camera sends on its own, without a task):
                                         ETag (send it back as If-None-Match: 304 if still the
                                         newest). max>1: the details of up to max, newest first, as
                                         JSON; fetch each from /stream/pictures/{name}
-    The web page /stream.html shows them as they arrive. The newest 5 are also kept in memory
-    (stream_store.RecentCache), so checking for new ones and fetching them rarely touch storage.
+    The web page /stream.html shows them as they arrive (without storing them). The newest 5 are
+    kept in memory (stream_store.RecentCache), so checking for new ones and fetching them rarely
+    touch storage.
 
 MCP (streamable HTTP, no auth), at /api/mcp:
     get_course_correction(context_and_instructions, course_target)
@@ -66,9 +69,26 @@ Task ids are GUIDs. Where tasks and pictures are kept is set in .env (see .env.e
   otherwise                        on the local disk: CAMERA_DB (default ./data/camera_tasks.db),
                                    CAMERA_PICTURES (default ./data/pictures) and CAMERA_STREAM_DIR
                                    (default ./data/stream)
+  CAMERA_STREAM_STORE_ALL=true     store every streamed picture as it arrives, not only fetched ones
+
+Visuals access: everything that gives out pictures, or what is in them, needs the secret
+CAMERA_VISUALS_ACCESS in an X-Visuals-Access header: the task and stream reads (GET
+/picture-tasks..., GET /stream/...) and the MCP endpoint. Without it (or with a wrong one): 401.
+If the service has no secret set, those are all refused (503). Open: the camera's own calls
+(next-task, the uploads, the stream push), /health, /picture-defaults, ordering a picture, and
+the web pages themselves (which ask for the secret and send it). Only in a header, never in the
+URL, so it doesn't end up in logs or browser history.
+
+HTTPS: everything has to come over https, except the camera's POST /api/stream/pictures (plain
+http is quicker for it). Behind Azure Container Apps' ingress, which ends TLS, the request's
+X-Forwarded-Proto header says how the client connected: "http" gets a 308 redirect to https for
+GET / HEAD (browsers) and 403 for anything else (an API client should fix its address rather
+than send its request in the clear twice). Without the header (a local run, the container's own
+health check) nothing is enforced. CAMERA_REQUIRE_HTTPS=false turns it off.
 """
 
 import contextlib
+import hmac
 import os
 import uuid
 from collections import OrderedDict
@@ -78,7 +98,8 @@ from pathlib import Path
 from typing import Literal, Optional
 
 from dotenv import load_dotenv
-from fastapi import APIRouter, BackgroundTasks, FastAPI, HTTPException, Query, Request, Response
+from fastapi import APIRouter, BackgroundTasks, Depends, FastAPI, Header, HTTPException, Query, Request, Response
+from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 from mcp.server.mcpserver import MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
@@ -185,6 +206,7 @@ def open_store():
     return LocalTaskStore(str(db), os.environ.get("CAMERA_PICTURES", str(db.parent / "pictures")))
 
 
+STREAM_STORE_ALL = os.environ.get("CAMERA_STREAM_STORE_ALL", "").lower() in ("1", "true", "yes")
 STREAM_CACHE_SIZE = 5  # newest stream pictures kept in memory, so the live viewer rarely waits on storage
 
 
@@ -220,6 +242,74 @@ app = FastAPI(title="Audrey camera service", version="0.2", lifespan=lifespan,
               docs_url=API_PREFIX + "/docs", redoc_url=API_PREFIX + "/redoc", openapi_url=API_PREFIX + "/openapi.json")
 api = APIRouter(prefix=API_PREFIX)
 
+VISUALS_ACCESS = os.environ.get("CAMERA_VISUALS_ACCESS", "")
+VISUALS_HEADER = "X-Visuals-Access"
+
+
+def visuals_access_problem(given):
+    """None if `given` is the visuals access secret; otherwise (HTTP status, message)."""
+    if not VISUALS_ACCESS:
+        return 503, "pictures are locked: the service has no visuals access secret (CAMERA_VISUALS_ACCESS)"
+    if not given or not hmac.compare_digest(given.encode(), VISUALS_ACCESS.encode()):
+        return 401, "the %s header is missing or wrong" % VISUALS_HEADER
+    return None
+
+
+def require_visuals_access(x_visuals_access: Optional[str] = Header(None, include_in_schema=False)):
+    problem = visuals_access_problem(x_visuals_access)
+    if problem:
+        raise HTTPException(*problem)
+
+
+VISUALS = [Depends(require_visuals_access)]
+
+
+class McpVisualsAccess:
+    """The MCP endpoint (a mounted app of its own) behind the same secret."""
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] == "http":
+            given = dict(scope["headers"]).get(VISUALS_HEADER.lower().encode(), b"").decode("latin-1")
+            problem = visuals_access_problem(given)
+            if problem:
+                await JSONResponse({"detail": problem[1]}, status_code=problem[0])(scope, receive, send)
+                return
+        await self.app(scope, receive, send)
+
+
+REQUIRE_HTTPS = os.environ.get("CAMERA_REQUIRE_HTTPS", "true").lower() not in ("0", "false", "no")
+PLAIN_HTTP_ALLOWED = {("POST", API_PREFIX + "/stream/pictures")}  # the camera's push
+
+
+class RequireHttps:
+    """ASGI middleware: see "HTTPS" at the top of this file. (Plain ASGI rather than
+    @app.middleware, which buffers responses and would get in the MCP endpoint's way.)"""
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] == "http" and REQUIRE_HTTPS:
+            headers = {k.decode("latin-1").lower(): v.decode("latin-1") for k, v in scope["headers"]}
+            proto = headers.get("x-forwarded-proto", "").split(",")[0].strip().lower()
+            if proto == "http" and (scope["method"], scope["path"]) not in PLAIN_HTTP_ALLOWED:
+                if scope["method"] in ("GET", "HEAD"):
+                    host = headers.get("x-forwarded-host") or headers.get("host", "")
+                    query = scope.get("query_string", b"").decode("latin-1")
+                    location = "https://%s%s%s" % (host, scope.get("root_path", "") + scope["path"], "?" + query if query else "")
+                    response = Response(status_code=308, headers={"Location": location})
+                else:
+                    response = JSONResponse({"detail": "use https"}, status_code=403)
+                await response(scope, receive, send)
+                return
+        await self.app(scope, receive, send)
+
+
+app.add_middleware(RequireHttps)
+
 
 def parse_utc(text, field="taken_at"):
     """An ISO 8601 time that says it is UTC ("Z" or "+00:00"), normalised; HTTP 422 otherwise."""
@@ -251,12 +341,12 @@ def create_task(request: Optional[TaskRequest] = None):
     return store.create(params.model_dump(mode="json"), request.requested_by)
 
 
-@api.get("/picture-tasks", response_model=list[Task])
+@api.get("/picture-tasks", response_model=list[Task], dependencies=VISUALS)
 def list_tasks(status: Optional[Literal["pending", "assigned", "done"]] = None, limit: int = Query(100, ge=1, le=1000)):
     return store.list(status, limit)
 
 
-@api.get("/picture-tasks/{task_id}", response_model=Task)
+@api.get("/picture-tasks/{task_id}", response_model=Task, dependencies=VISUALS)
 def get_task(task_id: uuid.UUID):
     task = store.get(str(task_id))
     if task is None:
@@ -312,7 +402,7 @@ async def upload_picture(task_id: uuid.UUID, request: Request,
     return task
 
 
-@api.get("/picture-tasks/{task_id}/picture", response_class=Response,
+@api.get("/picture-tasks/{task_id}/picture", response_class=Response, dependencies=VISUALS,
          responses={200: {"content": {"image/jpeg": {}}}, 404: {"description": "no such task or no picture yet"}})
 def get_picture(task_id: uuid.UUID, marks: bool = Query(True, description="draw the navigation marks on it")):
     response = jpeg_response(task_id, lambda: store.picture(str(task_id)), marks)
@@ -327,16 +417,29 @@ async def push_stream_picture(request: Request, background: BackgroundTasks,
                               taken_at: str = Query(..., description="when the picture was taken, ISO 8601 UTC"),
                               camera: Optional[str] = Query(None, max_length=100, description="the camera's name")):
     """Answers as soon as the picture is checked and cached (the live viewer can show it from
-    then on); it is written to storage after the answer, in a worker thread. A failed write is
-    logged and counted in /health ("stream")."""
+    then on). It is stored only when fetched (see the top of this file), or right away with
+    CAMERA_STREAM_STORE_ALL: after the answer, in a worker thread; a failed write is logged and
+    counted in /health ("stream")."""
     when = datetime.fromisoformat(parse_utc(taken_at))
     data = await jpeg_body(request)
     item = stream.accept(when, data, camera)
-    background.add_task(stream.save, item, data)  # a plain function: run in the thread pool
+    if STREAM_STORE_ALL:
+        store_later(background, item["name"])
     return item
 
 
-@api.get("/stream/pictures", response_model=list[StreamPicture])
+def store_later(background, name):
+    """Stores a cached stream picture after the response, unless it is stored already."""
+    kept = stream.keep(name)
+    if kept:
+        background.add_task(stream.save, *kept)  # a plain function: run in the thread pool
+
+
+FETCH_NO_STORE = Query(False, description="don't store the picture because of this fetch (for viewing the stream); "
+                                          "by default a fetched picture is stored")
+
+
+@api.get("/stream/pictures", response_model=list[StreamPicture], dependencies=VISUALS)
 def list_stream_pictures(after: Optional[str] = Query(None, description="only pictures newer than this one (its name)"),
                          window: Optional[str] = Query(None, description="one 10-minute folder, e.g. 20261028T1450Z"),
                          limit: int = Query(50, ge=1, le=500)):
@@ -347,15 +450,16 @@ def list_stream_pictures(after: Optional[str] = Query(None, description="only pi
     return stream.list(after, limit, window)
 
 
-@api.get("/stream/latest",
+@api.get("/stream/latest", dependencies=VISUALS,
          responses={200: {"content": {"image/jpeg": {}, "application/json": {}},
                           "description": "max=1: the newest picture itself; max>1: the newest pictures' details"},
                     204: {"description": "no picture (newer than since, or in the last hour)"},
                     304: {"description": "max=1: the newest is still the one named in If-None-Match"}})
-def latest_stream_pictures(request: Request,
+def latest_stream_pictures(request: Request, background: BackgroundTasks,
                            since: Optional[str] = Query(None, description="only pictures taken after this time, ISO 8601 UTC"),
                            max: int = Query(1, ge=1, le=100, description="how many of the newest; 1 returns the picture itself"),
-                           marks: bool = Query(True, description="max=1: draw the navigation marks on it")):
+                           marks: bool = Query(True, description="max=1: draw the navigation marks on it"),
+                           fetch_no_store: bool = FETCH_NO_STORE):
     after = stream_store.after_time(datetime.fromisoformat(parse_utc(since, "since"))) if since else None
     items = stream.list(after, max)
     if not items:
@@ -371,16 +475,22 @@ def latest_stream_pictures(request: Request,
     response = jpeg_response(("stream", item["name"]), lambda: stream.picture(item["name"]), marks)
     if response is None:
         return Response(status_code=204)
+    if not fetch_no_store:
+        store_later(background, item["name"])
     response.headers.update(headers)
     return response
 
 
-@api.get("/stream/pictures/{name:path}", response_class=Response,
+@api.get("/stream/pictures/{name:path}", response_class=Response, dependencies=VISUALS,
          responses={200: {"content": {"image/jpeg": {}}}, 404: {"description": "no such picture"}})
-def get_stream_picture(name: str, marks: bool = Query(True, description="draw the navigation marks on it")):
+def get_stream_picture(name: str, background: BackgroundTasks,
+                       marks: bool = Query(True, description="draw the navigation marks on it"),
+                       fetch_no_store: bool = FETCH_NO_STORE):
     response = jpeg_response(("stream", name), lambda: stream.picture(name), marks)
     if response is None:
         raise HTTPException(404, "no such picture")
+    if not fetch_no_store:
+        store_later(background, name)
     return response
 
 
@@ -405,6 +515,6 @@ async def get_course_correction(context_and_instructions: str, course_target: st
 
 
 app.include_router(api)
-app.mount(API_PREFIX, mcp_app)  # /api/mcp; after the router, so the API's own paths come first
+app.mount(API_PREFIX, McpVisualsAccess(mcp_app))  # /api/mcp; after the router, so the API's own paths come first
 # Last, so it only gets what the API doesn't answer.
 app.mount("/", StaticFiles(directory=Path(__file__).resolve().parent / "static", html=True), name="web")

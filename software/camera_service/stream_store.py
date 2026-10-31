@@ -180,20 +180,23 @@ class RecentCache:
     """Keeps the newest few pictures in memory in front of another stream store, so the viewer's
     "anything newer than X?" and fetching a just-arrived picture don't go to storage.
 
-    Two ways in: put() stores a picture and then caches it; accept() caches it at once and
-    save() stores it later (the service does that in the background, so the camera gets its
-    answer without waiting for storage). With accept(), a picture can be seen before it is
-    stored, and one whose save fails stays only in memory: failures are logged and counted.
+    Two ways in: put() stores a picture and then caches it; accept() only caches it. A cached
+    picture is stored later if wanted: keep(name) marks it (once) and returns what save() needs,
+    and save() stores it (the service does that in the background, so nobody waits for storage).
+    So by default only the pictures someone fetched end up in storage; the others are gone once
+    newer ones push them out of the cache. A save that fails is logged and counted.
     list(after=X) is answered from memory when X is at least as new as the oldest cached picture:
     the cache then holds every picture newer than X (it keeps the newest by name, so anything it
     let go of is older). Otherwise, and for list() without `after` or with `window`, the store is
-    asked. Only right with one service replica: another replica wouldn't see this one's uploads.
+    asked too, and the cached pictures added. Only right with one service replica: another
+    replica wouldn't see this one's uploads.
     """
 
     def __init__(self, store, size=5):
         self.store = store
         self.size = size
         self._items = {}  # name -> (item, jpeg)
+        self._kept = set()  # names of cached pictures being or already stored
         self._lock = threading.Lock()  # save() runs in worker threads
         self.pending = self.saved = self.failed = 0
 
@@ -202,19 +205,30 @@ class RecentCache:
             self._items[item["name"]] = (item, data)
             for name in sorted(self._items)[:-self.size]:  # keep the newest by name
                 del self._items[name]
+                self._kept.discard(name)
 
     def put(self, when, data, camera=None):
         item = self.store.put(when, data, camera)
         self._remember(item, data)
+        with self._lock:
+            self._kept.add(item["name"])
         return item
 
     def accept(self, when, data, camera=None):
-        """Names and caches a picture now; save(item, data) stores it."""
+        """Names and caches a picture, without storing it (see keep)."""
         item = new_item(when, data, camera)
         self._remember(item, data)
-        with self._lock:
-            self.pending += 1
         return item
+
+    def keep(self, name):
+        """Marks a cached picture to be stored: returns (item, jpeg) for save(), or None if it
+        isn't cached (stored already, or gone) or is already being stored."""
+        with self._lock:
+            if name not in self._items or name in self._kept:
+                return None
+            self._kept.add(name)
+            self.pending += 1
+            return self._items[name]
 
     def save(self, item, data):
         try:
@@ -239,7 +253,11 @@ class RecentCache:
                 return _select(cached, after, limit)
             if after is None and len(cached) >= limit:  # the newest few: all in memory
                 return _select(cached, None, limit)
-        return self.store.list(after, limit, window)
+        stored = self.store.list(after, limit, window)
+        names = {i["name"] for i in stored}
+        folders = set(windows_to_scan(after, window))  # the same time span the store looked at
+        extra = [i for i in cached if i["name"] not in names and i["name"].split("/")[0] in folders]
+        return _select(stored + extra, after, limit)
 
     def picture(self, name):
         with self._lock:
