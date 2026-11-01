@@ -8,6 +8,8 @@ server. Each wake-up sends one message:
 
     Wake-up 12 at 2026-10-29T20:15:30Z (the previous one started 19.4 s ago)
     Mission: <captain/mission.md, read afresh every time, so it can be edited while this runs>
+    Mission progress (your notes): <the captain's own notes (progress.py): kept outside the
+                   conversation, so they survive its summaries; cleared when a run starts>
     Boat state: {...}            (state.py, from the telemetry folder)
     Camera notes: <the lookout's notes since the previous wake-up, or its newest one if there
                    are none since: camera_observation>
@@ -39,7 +41,8 @@ import tracing
 from camera_observation.notes import Notes
 from camera_observation.notes import describe as describe_note
 from captain import agent as captain_agent
-from captain.control import PAUSED, RUNNING, CaptainLog, Control
+from captain.control import PAUSED, RUNNING, CaptainLog, Control, mission_complete_tool
+from captain.progress import MissionProgress, progress_tool
 from captain.state import boat_state
 from telemetry_service import TelemetryProvider
 
@@ -70,12 +73,14 @@ def camera_notes_text(notes, since, now):
     return head + "\n".join(describe_note(note, now) for note in shown)
 
 
-def wake_up_message(n, since_last_s, mission, state, now=None, camera_notes="(no lookout running)", note=None):
+def wake_up_message(n, since_last_s, mission, state, now=None, camera_notes="(no lookout running)", note=None,
+                    progress=None):
     now = time.time() if now is None else now
     stamp = datetime.fromtimestamp(now, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     previous = "the first one" if since_last_s is None else "the previous one started %.1f s ago" % since_last_s
-    return "Wake-up %d at %s (%s)%s\n\nMission:\n%s\n\nBoat state:\n%s\n\nCamera notes (the lookout, oldest first):\n%s" % (
-        n, stamp, previous, "\n" + note if note else "", mission, json.dumps(state, indent=1), camera_notes)
+    progress_part = "\n\nMission progress (your notes):\n%s" % progress if progress is not None else ""
+    return "Wake-up %d at %s (%s)%s\n\nMission:\n%s%s\n\nBoat state:\n%s\n\nCamera notes (the lookout, oldest first):\n%s" % (
+        n, stamp, previous, "\n" + note if note else "", mission, progress_part, json.dumps(state, indent=1), camera_notes)
 
 
 def what_happened(messages):
@@ -133,13 +138,15 @@ def replies_of(messages):
 
 class Captain:
     def __init__(self, agent, telemetry, mission_file, sleep_s=DEFAULT_SLEEP_S, thread_id=None,
-                 cycle_timeout_s=CYCLE_TIMEOUT_S, notes=None, control=None, captain_log=None, stop_boat=None):
+                 cycle_timeout_s=CYCLE_TIMEOUT_S, notes=None, control=None, captain_log=None, stop_boat=None,
+                 progress=None):
         self.agent, self.telemetry, self.mission_file = agent, telemetry, mission_file
         self.notes = notes  # camera_observation.notes.Notes, or None
         self.sleep_s, self.cycle_timeout_s = sleep_s, cycle_timeout_s
         self.control = control  # control.Control, or None: always running (tests, scripts)
         self.captain_log = captain_log  # control.CaptainLog, or None
         self.stop_boat = stop_boat  # async () -> result: the boat's stop tool, or None
+        self.progress = progress  # progress.MissionProgress, or None
         self.config = {"configurable": {"thread_id": thread_id or "captain-%d" % time.time()}}
         self.run_id = None
         self.wake_ups = 0
@@ -163,7 +170,8 @@ class Captain:
         state = boat_state(self.telemetry, now)
         message = wake_up_message(self.wake_ups, None if self.last_wake_up is None else now - self.last_wake_up,
                                   read_mission(self.mission_file), state, now,
-                                  camera_notes_text(self.notes, self.last_wake_up, now), self.note)
+                                  camera_notes_text(self.notes, self.last_wake_up, now), self.note,
+                                  self.progress.text() if self.progress is not None else None)
         self.last_wake_up, self.note = now, None
         entry = {"kind": "wake-up", "n": self.wake_ups, "boat": state}
         try:
@@ -197,7 +205,8 @@ class Captain:
         return result
 
     async def follow_control(self):
-        """Acts on a new command from the UI. Returns whether the captain should be waking up."""
+        """Acts on a new command (from the UI, or the captain's own mission_complete). Returns
+        whether the captain should be waking up."""
         if self.control is None:
             return True
         control = self.control.read()
@@ -209,6 +218,8 @@ class Captain:
                 self.run_id = control.get("run_id")
                 self.config = {"configurable": {"thread_id": "run-%s" % self.run_id}}
                 self.wake_ups, self.last_wake_up, self.paused_at, self.note = 0, None, None, None
+                if self.progress is not None:
+                    self.progress.clear()  # a new run: the previous one's notes don't apply
                 log.info("mission started (run %s)", self.run_id)
                 self._log({"kind": "command", "command": "start", "mission": read_mission(self.mission_file)})
             elif command == "resume":
@@ -220,7 +231,10 @@ class Captain:
             elif command in ("pause", "end", "cancel"):
                 self.paused_at = time.time() if command == "pause" else None
                 result = await self._stop_boat(command)
-                self._log({"kind": "command", "command": command, "boat_stop": result})
+                entry = {"kind": "command", "command": command, "boat_stop": result, "by": control.get("by", "operator")}
+                if control.get("note"):
+                    entry["note"] = control["note"]
+                self._log(entry)
         return control.get("state") == RUNNING
 
     async def run(self, stopping):
@@ -270,10 +284,13 @@ async def main_async():
         return
     log.info("tools: %s; waking up %g s after each wake-up ends while a mission runs; mission from %s",
              ", ".join(t.name for t in tools), sleep_s, mission_file)
-    agent = captain_agent.build_agent(captain_agent.model(), tools, sleep_s)
+    progress, control = MissionProgress(), Control()
+    agent = captain_agent.build_agent(captain_agent.model(), list(tools) + [progress_tool(progress), mission_complete_tool(control)],
+                                      sleep_s)
     stop_tool = next((t for t in tools if t.name == "stop"), None)
-    await Captain(agent, TelemetryProvider(), mission_file, sleep_s, notes=Notes(), control=Control(),
-                  captain_log=CaptainLog(), stop_boat=(lambda: stop_tool.ainvoke({})) if stop_tool else None).run(stopping)
+    await Captain(agent, TelemetryProvider(), mission_file, sleep_s, notes=Notes(), control=control,
+                  captain_log=CaptainLog(), stop_boat=(lambda: stop_tool.ainvoke({})) if stop_tool else None,
+                  progress=progress).run(stopping)
     log.info("stopped")
 
 

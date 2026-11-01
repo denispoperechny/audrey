@@ -28,6 +28,7 @@ from pydantic import BaseModel, Field
 from camera_observation.notes import Notes, describe
 from captain.captain import DEFAULT_MISSION_FILE
 from captain.control import CaptainLog, Control
+from captain.progress import MissionProgress
 from captain.state import boat_state
 from telemetry_service import TelemetryProvider
 
@@ -52,8 +53,9 @@ def note_line(note, now):
         return "- (unreadable note: %s) %s" % (e, note.get("summary") or note.get("status") or "")
 
 
-def create_app(control=None, captain_log=None, notes=None, telemetry=None):
+def create_app(control=None, captain_log=None, notes=None, telemetry=None, progress=None):
     control = control or Control()
+    progress = progress or MissionProgress()
     captain_log = captain_log or CaptainLog()
     notes = notes or Notes()
     telemetry = telemetry or TelemetryProvider()
@@ -66,6 +68,7 @@ def create_app(control=None, captain_log=None, notes=None, telemetry=None):
         return {
             "now": datetime.fromtimestamp(now, timezone.utc).isoformat(timespec="seconds"),
             "control": control.read(),
+            "progress": progress.read(),  # the captain's own notes: what it believes is done and next
             "boat": boat_state(telemetry, now),
             "log": captain_log.entries(LOG_ENTRIES)[::-1],
             "notes": [{"line": note_line(n, now), **n} for n in shown],

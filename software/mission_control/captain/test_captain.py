@@ -143,3 +143,69 @@ def test_build_agent_runs_a_wake_up_with_tools_and_skills(tmp_path):
     system = SEEN_PROMPTS[0][0]
     assert system.type == "system" and "woken up again 15 seconds after each wake-up ends" in system.text
     assert "harbour" in system.text and "Entering a harbour safely." in system.text  # the skill is offered
+
+
+def test_the_conversation_is_summarized_once_it_grows(tmp_path):
+    """With small thresholds (the fixed part, system prompt and tool definitions, counts too):
+    what the model is sent stays under the trigger, summarizing takes an extra call only now
+    and then, and the evicted messages are saved under the agent's home."""
+    import itertools
+
+    from langchain_core.messages.utils import count_tokens_approximately
+
+    SEEN_PROMPTS.clear()
+    model = ToolCallingFake(messages=itertools.cycle([AIMessage(content="On course, nothing new. " * 20)]))
+    agent = captain_agent.build_agent(model, [], 15, home=tmp_path, history_trigger_tokens=12000, history_keep_tokens=4500)
+    sizes = []
+    for n in range(1, 151):  # ~90 tokens each
+        asyncio.run(agent.ainvoke({"messages": [{"role": "user", "content": "Wake-up %d. Boat state: navigating. " % n * 10}]},
+                                  {"configurable": {"thread_id": "t"}}))
+        sizes.append(count_tokens_approximately(SEEN_PROMPTS[-1]))
+    summaries = len(SEEN_PROMPTS) - 150
+    assert 1 <= summaries <= 4, summaries  # not on every wake-up
+    assert max(sizes) < 12000 and sizes[-1] < max(sizes)  # bounded; it shrank after a summary
+    assert list((tmp_path / "conversation_history").glob("*.md"))
+    summarizer_requests = [p for p in SEEN_PROMPTS if "## MISSION PROGRESS" in " ".join(str(m.content) for m in p)]
+    assert len(summarizer_requests) == summaries  # each summary was asked with our prompt
+
+
+def test_mission_progress_notes(tmp_path):
+    from captain.progress import NONE_YET, MissionProgress, progress_tool
+
+    progress = MissionProgress(str(tmp_path))
+    assert progress.text() == NONE_YET
+    update = progress_tool(progress)
+    assert update.invoke({"notes": "L2 reached 16:03. Now: L3 via W (fountain at 47.50242, -87.03954)."}).startswith("saved")
+    assert "fountain" in progress.text()
+    assert update.invoke({"notes": "x" * 3001}).startswith("not saved")  # too long: the old notes stay
+    assert "L2 reached" in progress.text()
+    msg = wake_up_message(5, 18.0, "Go to L2, then L3, then back to L1.", {"autopilot": "navigating"}, now=0,
+                          progress=progress.text())
+    assert "Mission:\nGo to L2, then L3, then back to L1.\n\nMission progress (your notes):\nL2 reached 16:03." in msg
+
+
+def test_a_new_run_clears_the_progress_notes_and_resume_keeps_them(telemetry, tmp_path):
+    from captain.control import Control
+    from captain.progress import NONE_YET, MissionProgress
+
+    control, progress = Control(str(tmp_path)), MissionProgress(str(tmp_path))
+    progress.write("left over from the previous run")
+    captain = Captain(StubAgent(), telemetry.provider, tmp_path / "m.md", control=control, progress=progress)
+    control.command("start")
+    asyncio.run(captain.follow_control())
+    assert progress.text() == NONE_YET
+    progress.write("L2 reached")
+    control.command("pause")
+    asyncio.run(captain.follow_control())
+    control.command("resume")
+    asyncio.run(captain.follow_control())
+    assert progress.read() == "L2 reached"
+    asyncio.run(captain.wake_up())
+    assert "Mission progress (your notes):\nL2 reached" in captain.agent.calls[-1][1]
+
+
+def test_summaries_are_asked_to_keep_the_mission_progress():
+    prompt = captain_agent.summary_prompt()
+    assert prompt.index("## MISSION PROGRESS") < prompt.index("## NEXT STEPS")
+    assert "{messages}" in prompt and "Never mark a waypoint as reached" in prompt
+    assert captain_agent.HISTORY_TRIGGER_TOKENS == 60_000 and captain_agent.HISTORY_KEEP_TOKENS == 22_500

@@ -117,3 +117,61 @@ def test_a_failed_wake_up_is_logged(telemetry, tmp_path):  # noqa: F811
     with pytest.raises(RuntimeError):
         asyncio.run(Captain(Broken(), telemetry.provider, tmp_path / "m.md", captain_log=log).wake_up())
     assert log.entries()[0]["error"] == "RuntimeError: model unavailable"
+
+
+def test_mission_complete_tool(tmp_path):
+    from captain.control import mission_complete_tool
+
+    control = Control(str(tmp_path))
+    done = mission_complete_tool(control)
+    assert done.invoke({"summary": "back at L1"}).startswith("not ended: can't end: the captain is idle")
+    control.command("start")
+    assert done.invoke({"summary": "L2, L3 reached; back at L1 (2.6 m)."}).startswith("the run is ended")
+    state = control.read()
+    assert state["state"] == "idle" and state["command"] == "end" and state["by"] == "captain"
+    assert state["note"] == "L2, L3 reached; back at L1 (2.6 m)."
+    control.command("start")
+    assert control.command("end")["by"] == "operator" and "note" not in control.read()
+
+
+class FinishingAgent(StubAgent):
+    """Calls mission_complete on its second wake-up, as the real captain would at the final point."""
+
+    def __init__(self, done):
+        super().__init__()
+        self.done = done
+
+    async def ainvoke(self, payload, config):
+        result = await super().ainvoke(payload, config)
+        if len(self.calls) == 2:
+            self.done.invoke({"summary": "Back at L1. Mission done."})
+        return result
+
+
+def test_the_captain_ends_the_run_itself(telemetry, tmp_path, monkeypatch):  # noqa: F811
+    from captain.control import mission_complete_tool
+
+    monkeypatch.setattr(captain_module, "CONTROL_POLL_S", 0.02)
+    control, log, stops = Control(str(tmp_path)), CaptainLog(str(tmp_path)), []
+    agent = FinishingAgent(mission_complete_tool(control))
+
+    async def stop_boat():
+        stops.append(1)
+        return "stopped"
+
+    captain = Captain(agent, telemetry.provider, tmp_path / "m.md", sleep_s=0.05, control=control, captain_log=log,
+                      stop_boat=stop_boat)
+    control.command("start")
+
+    async def go():
+        stopping = asyncio.Event()
+        task = asyncio.create_task(captain.run(stopping))
+        await asyncio.sleep(0.6)
+        stopping.set()
+        await task
+    asyncio.run(go())
+
+    assert len(agent.calls) == 2  # not woken up again after it ended the run
+    assert stops == [1]  # the boat was stopped, as on the operator's End
+    ended = [e for e in log.entries() if e.get("command") == "end"]
+    assert len(ended) == 1 and ended[0]["by"] == "captain" and ended[0]["note"] == "Back at L1. Mission done."

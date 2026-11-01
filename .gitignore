@@ -1,0 +1,8 @@
+# Mission data: raw logs and GPS tracks hold real positions, so they stay out of the repo
+# (each mission's data folder has its own .gitignore too; this catches new missions). Copies
+# with the positions and absolute times removed are named public_* and are kept.
+missions/**/data/**/*.jsonl
+missions/**/data/**/*.kml
+missions/**/data/**/*.gpx
+missions/**/data/**/*.nmea
+!missions/**/public_*.jsonl

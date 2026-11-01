@@ -65,8 +65,9 @@ class Control:
         except (FileNotFoundError, ValueError):
             return {"state": IDLE, "run_id": None, "changed_at": None, "command": None, "unix": 0}
 
-    def command(self, name, now=None):
-        """Applies a command; returns the new control dict. Raises ValueError if it doesn't apply."""
+    def command(self, name, now=None, by="operator", note=None):
+        """Applies a command; returns the new control dict. Raises ValueError if it doesn't apply.
+        `by`: who gave it ("operator" from the UI, "captain" from mission_complete), `note`: why."""
         if name not in COMMANDS:
             raise ValueError("unknown command %r" % name)
         allowed, new_state = COMMANDS[name]
@@ -76,9 +77,32 @@ class Control:
             if current["state"] not in allowed:
                 raise ValueError("can't %s: the captain is %s" % (name, current["state"]))
             control = {"state": new_state, "command": name, "unix": round(now, 3), "changed_at": _iso(now),
-                       "run_id": uuid.uuid4().hex[:8] if name == "start" else current.get("run_id")}
+                       "run_id": uuid.uuid4().hex[:8] if name == "start" else current.get("run_id"), "by": by}
+            if note:
+                control["note"] = note
             _write(self.path, json.dumps(control))
             return control
+
+
+def mission_complete_tool(control):
+    """The captain's way to end the run itself, once the mission is done: the same as the
+    operator's End, recorded as the captain's, with its summary."""
+    from langchain_core.tools import tool
+
+    @tool
+    def mission_complete(summary: str) -> str:
+        """Ends the mission run, once the mission is fully done (e.g. the boat has reached the final
+        point). The boat is stopped and you won't be woken up again until the operator starts a
+        new run. summary: one or two lines on how it went (points reached, anything notable).
+        Don't use it to give up: if the mission can't be finished safely, stop() and say why, and
+        the operator decides."""
+        try:
+            control.command("end", by="captain", note=summary.strip()[:500])
+        except ValueError as e:
+            return "not ended: %s" % e
+        return "the run is ended: the boat is being stopped and you won't be woken up again"
+
+    return mission_complete
 
 
 class CaptainLog:

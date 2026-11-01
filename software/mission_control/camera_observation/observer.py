@@ -16,6 +16,10 @@ Runs as its own process (supervisord.conf). Each look:
        the surroundings: what is new, what has gone, what is still there.
     4. works out each hazard's azimuth from the heading (geo.py, not the model) and appends the note
 
+It only looks while a mission is running (the captain's control state, captain/control.py):
+idle or paused, it fetches no pictures and asks no model, so it costs nothing. When a mission
+starts or resumes, it looks straight away.
+
 Looks never overlap: one that runs long is followed by the next straight away. The model is in
 Azure AI Foundry (FOUNDRY_OPENAI_URL, FOUNDRY_MODEL; boat_mcp.vision signs in). Settings:
 CAMERA_OBS_PERIOD_S, CAMERA_NOTES_FILE, CAMERA_SERVICE_URL, TELEMETRY_DIR.
@@ -163,9 +167,20 @@ class Lookout:
             "confidence": min(1.0, max(0.0, float(seen.get("confidence", 0)))),
         }, written)
 
-    def run(self, stopping):
+    def run(self, stopping, mission_running=None, poll_s=1.0):
+        """Looks every period_s until `stopping` is set. mission_running() (or None: always) says
+        whether to look at all; it is checked every poll_s while it says no."""
         next_at = time.monotonic()
+        was_running = None
         while not stopping.wait(max(0.0, next_at - time.monotonic())):
+            running = mission_running is None or mission_running()
+            if running != was_running and mission_running is not None:
+                log.info("mission %s: %s", "running" if running else "not running",
+                         "looking every %g s" % self.period_s if running else "not looking")
+            was_running = running
+            if not running:
+                next_at = time.monotonic() + poll_s
+                continue
             next_at = time.monotonic() + self.period_s
             try:
                 note = self.look()
@@ -177,6 +192,7 @@ class Lookout:
 
 def main():
     from boat_mcp.camera import CameraClient
+    from captain.control import RUNNING, Control
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     for noisy in ("httpx", "azure"):
@@ -184,11 +200,12 @@ def main():
     period_s = float(os.environ.get("CAMERA_OBS_PERIOD_S") or DEFAULT_PERIOD_S)
     notes = Notes()
     lookout = Lookout(CameraClient(), TelemetryProvider(), notes, period_s=period_s)
-    log.info("looking every %g s; notes in %s", period_s, notes.path)
+    log.info("looking every %g s while a mission runs; notes in %s", period_s, notes.path)
     stopping = threading.Event()
     signal.signal(signal.SIGTERM, lambda signum, frame: stopping.set())
     signal.signal(signal.SIGINT, lambda signum, frame: stopping.set())
-    lookout.run(stopping)
+    control = Control()
+    lookout.run(stopping, mission_running=lambda: control.read().get("state") == RUNNING)
     log.info("stopped")
 
 

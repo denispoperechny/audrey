@@ -7,6 +7,7 @@ from fastapi.testclient import TestClient
 
 from camera_observation.notes import Notes
 from captain.control import CaptainLog, Control
+from captain.progress import MissionProgress
 from mission_ui.app import create_app
 from telemetry_service import TelemetryProvider
 
@@ -15,8 +16,10 @@ from telemetry_service import TelemetryProvider
 def ui(tmp_path, monkeypatch):
     monkeypatch.setenv("CAPTAIN_MISSION_FILE", str(tmp_path / "mission" / "mission.md"))
     client = TestClient(create_app(Control(str(tmp_path)), CaptainLog(str(tmp_path)),
-                                   Notes(str(tmp_path / "notes.jsonl")), TelemetryProvider(str(tmp_path / "telemetry"))))
+                                   Notes(str(tmp_path / "notes.jsonl")), TelemetryProvider(str(tmp_path / "telemetry")),
+                                   MissionProgress(str(tmp_path))))
     client.log, client.notes = CaptainLog(str(tmp_path)), Notes(str(tmp_path / "notes.jsonl"))
+    client.progress = MissionProgress(str(tmp_path))
     return client
 
 
@@ -50,3 +53,6 @@ def test_status_shows_the_log_and_notes_newest_first(ui):
     assert [e["kind"] for e in status["log"]] == ["wake-up", "command"]
     assert "a buoy ahead" in status["notes"][0]["line"] and status["notes"][1]["summary"] == "open water"
     assert "none" in status["boat"]["telemetry"] and status["control"]["state"] == "idle"
+    assert status["progress"] == ""
+    ui.progress.write("L2 reached 16:03; now to L3 via W")
+    assert ui.get("/api/status").json()["progress"] == "L2 reached 16:03; now to L3 via W"

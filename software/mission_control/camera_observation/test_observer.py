@@ -114,3 +114,32 @@ def test_captain_gets_the_notes_since_its_previous_wake_up(notes):
     assert "second" in text and "third" in text and "first" not in text
     nothing_new = camera_notes_text(notes, since=121, now=125)
     assert nothing_new.startswith("(nothing new since the previous wake-up") and "third" in nothing_new
+
+
+def test_looks_only_while_the_mission_runs(notes, telemetry):
+    import threading
+
+    telemetry(heading=10, at=time.time())
+    asked, state = [], {"running": False}
+
+    def ask(jpeg, context, timeout):
+        asked.append(time.monotonic())
+        return {"summary": "open water", "hazards": [], "clear_ahead_m": 50, "confidence": 0.9}
+
+    lookout = Lookout(FakeCamera(taken_ago=0.5), telemetry.provider, notes, ask=ask, period_s=0.2)
+    stopping = threading.Event()
+    worker = threading.Thread(target=lookout.run, args=(stopping, lambda: state["running"], 0.02))
+    worker.start()
+    time.sleep(0.3)
+    assert asked == [] and notes.all() == []  # idle: no pictures, no model
+    started = time.monotonic()
+    state["running"] = True
+    time.sleep(0.5)
+    assert len(asked) >= 2 and asked[0] - started < 0.1  # looks straight away, then every period
+    state["running"] = False  # paused or ended
+    time.sleep(0.05)
+    count = len(asked)
+    time.sleep(0.4)
+    stopping.set()
+    worker.join(2)
+    assert len(asked) == count and not worker.is_alive()

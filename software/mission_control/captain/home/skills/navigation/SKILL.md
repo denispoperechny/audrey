@@ -87,7 +87,8 @@ Read the boat state first, in this order:
      going down over the last 10-20 s, and that `relative_bearing_deg` stays small (the bow
      points at the leg's end).
    - `arrived` (or no destination): the leg is done. If the final destination is reached, stop
-     and report; otherwise plan and send the next leg.
+     and call `mission_complete` with a short summary (it ends the run); otherwise plan and send
+     the next leg.
 3. **Is something wrong?** Act when:
    - the distance to the leg's end hasn't gone down for about 20-30 s while navigating,
      or `speed_m_s` stays near 0 (stuck, aground, against something, or the autopilot isn't

@@ -91,6 +91,10 @@
   </div>
   <div>
     <section>
+      <h2>Mission progress <span class="muted" style="font-weight:400;font-size:12px">the captain's own notes: what it believes is done and next</span></h2>
+      <div id="progress" class="said muted">None yet.</div>
+    </section>
+    <section>
       <h2>Captain <span class="muted" style="font-weight:400;font-size:12px">decisions, newest first</span></h2>
       <div id="log" class="entries"><span class="muted">Nothing yet.</span></div>
     </section>
@@ -188,7 +192,8 @@ function entry(e) {
   if (e.kind === "command") {
     const extra = e.command === "start" ? "\n" + (e.mission || "") : e.boat_stop ? " · boat stop: " + e.boat_stop : "";
     return el("div", { className: "entry command" }, el("div", { className: "when", textContent: clock(e.t) + " · run " + (e.run_id || "") }),
-              el("div", { className: "said", textContent: "Operator: " + e.command + extra }));
+              el("div", { className: "said", textContent: (e.by === "captain" ? "Captain: " : "Operator: ") + e.command + extra +
+                                                     (e.note ? "\n" + e.note : "") }));
   }
   const node = el("div", { className: "entry" + (e.error ? " error" : "") },
     el("div", { className: "when", textContent: `${clock(e.t)} · wake-up ${e.n}${e.took_s != null ? " · " + e.took_s + " s" : ""}${tokens(e.tokens)}` }));
@@ -217,6 +222,8 @@ async function poll() {
   try {
     const s = await api("/status");
     showControl(s.control);
+    $("progress").textContent = s.progress || "None yet.";
+    $("progress").classList.toggle("muted", !s.progress);
     showBoat(s.boat);
     showLog(s.log);
     showNotes(s.notes);

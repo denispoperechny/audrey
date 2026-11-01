@@ -21,6 +21,25 @@ DEFAULT_BOAT_MCP_URL = "http://localhost:8100/mcp"
 HOME = Path(os.environ.get("CAPTAIN_HOME") or Path(__file__).resolve().parent / "home")
 MODEL_TIMEOUT_S = 60
 TOOL_TIMEOUT_S = 120  # visual_observe can take ~75 s
+# The conversation's size: once it passes HISTORY_TRIGGER_TOKENS, deepagents summarizes the
+# older part (one extra model call) and keeps about the last HISTORY_KEEP_TOKENS as they were
+# (the evicted messages go to conversation_history/ under the agent's home). Its own default
+# for this model would be 85% / 10% of the 1M-token context: never reached in a mission, while
+# every wake-up re-sends the whole conversation.
+HISTORY_TRIGGER_TOKENS = 60_000
+HISTORY_KEEP_TOKENS = 22_500
+# What a summary has to keep for the captain, added to deepagents' own summary prompt. The
+# mission itself is in every wake-up message, and the captain's progress notes too
+# (progress.py), so neither depends on the summary; this is the second line of defence.
+MISSION_SUMMARY_SECTION = """## MISSION PROGRESS
+
+The mission (each wake-up message repeats it) and how far it has got: every waypoint or leg
+already reached, with the time; the current target and the leg the boat is on; anything learned on
+the way that still matters (hazards with their positions or azimuths, shores, a detour chosen and
+why, failed looks, battery concerns, anything the operator said). Be exact with coordinates and
+directions. Never mark a waypoint as reached unless the conversation shows it was.
+
+"""
 
 SYSTEM_PROMPT = """You are the captain of Audrey, a small autonomous boat. You are in charge of
 getting her to the mission's destination safely: safety comes before speed.
@@ -48,7 +67,15 @@ Don't do position or direction arithmetic in your head: use the calculation tool
 split_into_legs). They are exact and fast.
 
 If the telemetry is missing or stale, the GPS has no fix, or the boat is on remote control, don't
-send navigation commands: say what you see and wait. When you act, say in one line why."""
+send navigation commands: say what you see and wait. When you act, say in one line why.
+
+When the whole mission is done (the boat at its final point), stop() the boat and call
+mission_complete with a short summary: that ends the run, so you aren't woken up for nothing.
+Don't use it to give up: if the mission can't be finished safely, stop() and say why.
+
+Older parts of this conversation are summarized from time to time. The mission and your mission
+progress notes are on every wake-up, so keep the notes current with update_mission_progress
+whenever something changes: a waypoint reached, a hazard located, a plan changed."""
 
 
 def model():
@@ -72,20 +99,36 @@ async def boat_tools():
     return await client.get_tools()
 
 
-def build_agent(chat_model, tools, sleep_s, home=HOME):
+def summary_prompt():
+    from deepagents.middleware.summarization import DEEPAGENTS_DEFAULT_SUMMARY_PROMPT
+
+    marker = "## NEXT STEPS"
+    if marker not in DEEPAGENTS_DEFAULT_SUMMARY_PROMPT:  # a deepagents update changed it: put ours first
+        return MISSION_SUMMARY_SECTION + DEEPAGENTS_DEFAULT_SUMMARY_PROMPT
+    return DEEPAGENTS_DEFAULT_SUMMARY_PROMPT.replace(marker, MISSION_SUMMARY_SECTION + marker, 1)
+
+
+def build_agent(chat_model, tools, sleep_s, home=HOME, history_trigger_tokens=HISTORY_TRIGGER_TOKENS,
+                history_keep_tokens=HISTORY_KEEP_TOKENS):
     from deepagents import create_deep_agent
     from deepagents.backends import FilesystemBackend
+    from deepagents.middleware.summarization import SummarizationMiddleware
     from langgraph.checkpoint.memory import InMemorySaver
 
     from captain.geo_tools import TOOLS as GEO_TOOLS
 
     (Path(home) / "skills").mkdir(parents=True, exist_ok=True)
+    backend = FilesystemBackend(root_dir=str(home), virtual_mode=True)
+    # Same name as deepagents' own summarization middleware, so it replaces it in place.
+    history = SummarizationMiddleware(chat_model, backend=backend, trigger=("tokens", history_trigger_tokens),
+                                      keep=("tokens", history_keep_tokens), summary_prompt=summary_prompt())
     return create_deep_agent(
         model=chat_model,
         tools=list(tools) + GEO_TOOLS,
         system_prompt=SYSTEM_PROMPT.format(sleep=sleep_s),
         skills=["/skills/"],
-        backend=FilesystemBackend(root_dir=str(home), virtual_mode=True),
+        backend=backend,
         checkpointer=InMemorySaver(),
+        middleware=[history],
         name="captain",
     )
