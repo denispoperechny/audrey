@@ -91,7 +91,11 @@ def test_look_writes_a_note_with_the_heading_when_the_picture_was_taken(notes, t
     assert len(notes.all()) == 2
 
 
-def test_look_without_a_picture_or_a_model(notes, telemetry):
+def test_look_without_a_picture_or_a_model(notes, telemetry, monkeypatch):
+    import tracing
+
+    traced = []
+    monkeypatch.setattr(tracing, "event", lambda kind, **fields: traced.append((kind, fields)))
     telemetry(heading=0, at=time.time())
     must_not_ask = lambda *a: pytest.fail("the model shouldn't be asked")  # noqa: E731
     assert "none taken in the last 5 s" in Lookout(FakeCamera(taken_ago=60), telemetry.provider, notes, ask=must_not_ask).look()["status"]
@@ -102,6 +106,7 @@ def test_look_without_a_picture_or_a_model(notes, telemetry):
 
     assert Lookout(FakeCamera(), telemetry.provider, notes, ask=broken).look()["status"] == "model error: slow"
     assert len(notes.all()) == 3
+    assert [f["status"].split(":")[0] for k, f in traced if k == "look"] == ["no fresh picture", "no fresh picture", "model error"]
 
 
 def test_captain_gets_the_notes_since_its_previous_wake_up(notes):

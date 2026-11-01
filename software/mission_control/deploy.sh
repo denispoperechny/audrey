@@ -34,6 +34,7 @@ ENV_VARS=(
   "CAMERA_VISUALS_ACCESS=secretref:visuals-access"
   "TRACE_STORAGE_ACCOUNT_URL=https://audreylogs.blob.core.windows.net"
   "TRACE_STORAGE_CONTAINER=logs"
+  "APP_VERSION=$TAG"
 )
 
 echo "== building $IMAGE"

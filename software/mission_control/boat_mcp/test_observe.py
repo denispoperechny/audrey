@@ -161,3 +161,35 @@ def test_mcp_visual_observe(tmp_path, monkeypatch):
             "original_gps": {"lat": ORIGINAL[0], "lon": ORIGINAL[1]}, "azimuth": 90, "request_note": "any buoys?"}})
         assert not out.get("isError"), out
         assert out["structuredContent"]["answer"] == "all clear"
+
+
+def test_stop_aborts_a_look_in_progress(tmp_path):
+    import threading
+
+    boat = TurningBoat(str(tmp_path / "telemetry"), [200])  # never turns
+    boat.telemetry(heading=200)
+    look = observer(boat, FakeCamera((0, 0)), align_timeout_s=30)
+    outcome = {}
+
+    def run():
+        try:
+            look.observe(*ORIGINAL, 90, "?")
+        except BoatError as e:
+            outcome["error"] = str(e)
+
+    worker = threading.Thread(target=run)
+    worker.start()
+    time.sleep(0.2)
+    sent_before = len(boat.sent)
+    look.abort()
+    worker.join(2)
+    assert not worker.is_alive() and outcome["error"].startswith("aborted")
+    assert len(boat.sent) == sent_before  # nothing sent after the abort: not even "go back"
+
+
+def test_mcp_stop_aborts_the_observer_first(monkeypatch):
+    calls = []
+    monkeypatch.setattr(server, "_observer", type("O", (), {"abort": lambda self: calls.append("abort")})())
+    monkeypatch.setattr(server, "_boat", type("B", (), {"stop": lambda self: calls.append("stop") or {"accepted": True, "note": ""}})())
+    server.stop_now()
+    assert calls == ["abort", "stop"]

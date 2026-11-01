@@ -69,6 +69,16 @@ through straight and perpendicular to the bridge in one leg.
   position, no fix, the autopilot holding. Don't react to it unless the boat stays stuck for
   30 s or more after it should be through. Wait for a good fix on the far side before planning
   the next leg.
+- **Expect the camera to go dark too.** Under the deck the picture is much darker, and the
+  lookout's notes will say so: low confidence, "too dark to see", walls or piers close on both
+  sides. That is the bridge itself, and it is expected: don't stop for it. The decision to go
+  through was made at the line-up point with the last look; from there, commit to the pass.
+  Only stop during the pass if a note reports something **in the span on the boat's line**
+  (a boat, a rope, debris ahead at about 0° from the bow), not for darkness or for the piers
+  either side.
+- Before sending the pass leg, note in your progress notes that you are passing under the bridge
+  (the time, the span, the target beyond it), so later wake-ups know the dark notes and odd
+  telemetry are the pass.
 
 ## 5. Afterwards
 

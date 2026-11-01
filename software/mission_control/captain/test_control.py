@@ -175,3 +175,106 @@ def test_the_captain_ends_the_run_itself(telemetry, tmp_path, monkeypatch):  # n
     assert stops == [1]  # the boat was stopped, as on the operator's End
     ended = [e for e in log.entries() if e.get("command") == "end"]
     assert len(ended) == 1 and ended[0]["by"] == "captain" and ended[0]["note"] == "Back at L1. Mission done."
+
+
+def test_control_keeps_each_command_numbered(tmp_path):
+    control = Control(str(tmp_path))
+    control.command("start")
+    control.command("end")
+    control.command("start")
+    recent = control.read()["recent"]
+    assert [(c["seq"], c["command"]) for c in recent] == [(1, "start"), (2, "end"), (3, "start")]
+    assert recent[0]["run_id"] != recent[2]["run_id"]
+
+
+def test_pause_interrupts_a_long_wake_up_at_once(telemetry, tmp_path, monkeypatch):  # noqa: F811
+    monkeypatch.setattr(captain_module, "CONTROL_POLL_S", 0.02)
+    control, log, stops = Control(str(tmp_path)), CaptainLog(str(tmp_path)), []
+    agent = StubAgent(seconds=5.0)  # a long wake-up, like one with a visual_observe
+
+    async def stop_boat():
+        stops.append(time.monotonic())
+        return "stopped"
+
+    captain = Captain(agent, telemetry.provider, tmp_path / "m.md", sleep_s=0.05, control=control, captain_log=log,
+                      stop_boat=stop_boat)
+    control.command("start")
+
+    async def go():
+        stopping = asyncio.Event()
+        task = asyncio.create_task(captain.run(stopping))
+        await asyncio.sleep(0.3)  # the first wake-up is under way
+        paused = time.monotonic()
+        control.command("pause")
+        await asyncio.sleep(0.5)
+        assert stops and stops[0] - paused < 0.2  # stopped at once, not after the wake-up's 5 s
+        assert len(agent.calls) == 1  # paused: no new wake-up
+        control.command("resume")
+        await asyncio.sleep(0.3)
+        assert len(agent.calls) == 2  # resumed: woken up again
+        stopping.set()
+        await task
+    asyncio.run(go())
+
+    entries = log.entries()
+    assert entries[1]["error"] == "interrupted by an operator command"
+    assert [e["command"] for e in entries if e["kind"] == "command"][:3] == ["start", "pause", "resume"]
+
+
+def test_end_and_start_during_a_wake_up_are_both_acted_on(telemetry, tmp_path, monkeypatch):  # noqa: F811
+    monkeypatch.setattr(captain_module, "CONTROL_POLL_S", 0.05)
+    control, log, stops = Control(str(tmp_path)), CaptainLog(str(tmp_path)), []
+    agent = StubAgent(seconds=5.0)
+
+    async def stop_boat():
+        stops.append(1)
+        return "stopped"
+
+    captain = Captain(agent, telemetry.provider, tmp_path / "m.md", sleep_s=0.05, control=control, captain_log=log,
+                      stop_boat=stop_boat)
+    first = control.command("start")["run_id"]
+
+    async def go():
+        stopping = asyncio.Event()
+        task = asyncio.create_task(captain.run(stopping))
+        await asyncio.sleep(0.3)
+        control.command("end")  # both between two checks
+        second = control.command("start")["run_id"]
+        await asyncio.sleep(0.4)
+        stopping.set()
+        await task
+        return second
+    second = asyncio.run(go())
+
+    commands = [(e["command"], e["run_id"]) for e in log.entries() if e["kind"] == "command"]
+    assert commands == [("start", first), ("end", first), ("start", second)]
+    assert stops == [1]  # the end stopped the boat
+    assert agent.calls[-1][2] == {"configurable": {"thread_id": "run-" + second}}  # the new run's conversation
+
+
+def test_the_captains_own_end_doesnt_cut_its_wake_up_short(telemetry, tmp_path, monkeypatch):  # noqa: F811
+    from captain.control import mission_complete_tool
+
+    monkeypatch.setattr(captain_module, "CONTROL_POLL_S", 0.02)
+    control, log = Control(str(tmp_path)), CaptainLog(str(tmp_path))
+
+    class SlowFinisher(StubAgent):
+        async def ainvoke(self, payload, config):
+            mission_complete_tool(control).invoke({"summary": "done"})
+            await asyncio.sleep(0.3)  # still saying its last words
+            return {"messages": [AIMessage(content="Mission complete.")]}
+
+    captain = Captain(SlowFinisher(), telemetry.provider, tmp_path / "m.md", sleep_s=0.05, control=control,
+                      captain_log=log, stop_boat=None)
+    control.command("start")
+
+    async def go():
+        stopping = asyncio.Event()
+        task = asyncio.create_task(captain.run(stopping))
+        await asyncio.sleep(0.6)
+        stopping.set()
+        await task
+    asyncio.run(go())
+    wake = next(e for e in log.entries() if e["kind"] == "wake-up")
+    assert "error" not in wake and wake["said"] == ["Mission complete."]
+    assert [e["command"] for e in log.entries() if e["kind"] == "command"] == ["start", "end"]

@@ -134,7 +134,9 @@ class Lookout:
             tracing.event("look", status=note["status"])
             return note
         if picture is None:
-            return self.notes.append({"status": "no fresh picture: none taken in the last %g s" % self.max_picture_age_s}, now)
+            note = self.notes.append({"status": "no fresh picture: none taken in the last %g s" % self.max_picture_age_s}, now)
+            tracing.event("look", status=note["status"])
+            return note
 
         boat = self.boat_when(picture.taken_unix)
         previous = self.notes.latest(self.history)
@@ -201,6 +203,7 @@ def main():
     notes = Notes()
     lookout = Lookout(CameraClient(), TelemetryProvider(), notes, period_s=period_s)
     log.info("looking every %g s while a mission runs; notes in %s", period_s, notes.path)
+    tracing.process_started(period_s=period_s, max_picture_age_s=MAX_PICTURE_AGE_S, history_notes=HISTORY_NOTES)
     stopping = threading.Event()
     signal.signal(signal.SIGTERM, lambda signum, frame: stopping.set())
     signal.signal(signal.SIGINT, lambda signum, frame: stopping.set())

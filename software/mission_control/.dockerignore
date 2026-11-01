@@ -9,3 +9,4 @@ test_*.py
 */test_*.py
 conftest.py
 requirements-dev.txt
+scenarios

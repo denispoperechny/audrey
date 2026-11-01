@@ -145,7 +145,7 @@ def test_build_agent_runs_a_wake_up_with_tools_and_skills(tmp_path):
     assert "harbour" in system.text and "Entering a harbour safely." in system.text  # the skill is offered
 
 
-def test_the_conversation_is_summarized_once_it_grows(tmp_path):
+def test_the_conversation_is_summarized_once_it_grows(tmp_path, monkeypatch):
     """With small thresholds (the fixed part, system prompt and tool definitions, counts too):
     what the model is sent stays under the trigger, summarizing takes an extra call only now
     and then, and the evicted messages are saved under the agent's home."""
@@ -153,6 +153,10 @@ def test_the_conversation_is_summarized_once_it_grows(tmp_path):
 
     from langchain_core.messages.utils import count_tokens_approximately
 
+    import tracing
+
+    traced = []
+    monkeypatch.setattr(tracing, "event", lambda kind, **fields: traced.append((kind, fields)))
     SEEN_PROMPTS.clear()
     model = ToolCallingFake(messages=itertools.cycle([AIMessage(content="On course, nothing new. " * 20)]))
     agent = captain_agent.build_agent(model, [], 15, home=tmp_path, history_trigger_tokens=12000, history_keep_tokens=4500)
@@ -167,6 +171,8 @@ def test_the_conversation_is_summarized_once_it_grows(tmp_path):
     assert list((tmp_path / "conversation_history").glob("*.md"))
     summarizer_requests = [p for p in SEEN_PROMPTS if "## MISSION PROGRESS" in " ".join(str(m.content) for m in p)]
     assert len(summarizer_requests) == summaries  # each summary was asked with our prompt
+    summary_events = [f for kind, f in traced if kind == "history-summary"]
+    assert len(summary_events) == summaries and summary_events[0]["summary"]  # each traced (one middleware, not two)
 
 
 def test_mission_progress_notes(tmp_path):

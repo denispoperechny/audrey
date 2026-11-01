@@ -7,7 +7,9 @@ CAPTAIN_STATE_DIR (default /tmp/audrey-captain).
                      running   it wakes up every 15-20 s with the mission
                      paused    the boat was stopped and the captain doesn't wake up; resuming goes
                                on with the same conversation
-                   with the run's id (a new one on every start), when and why it last changed.
+                   with the run's id (a new one on every start), when and why it last changed,
+                   and the last few commands, numbered (seq), so a reader that missed some (two
+                   given between its checks) still sees each one.
     log.jsonl      the captain's log, newest last (the newest KEEP_LOG entries): one entry per
                    wake-up (time, the boat state it saw, its tool calls and their results, what it
                    said, how long it took) and one per command (start, pause, ...).
@@ -25,6 +27,7 @@ from datetime import datetime, timezone
 
 DEFAULT_DIR = "/tmp/audrey-captain"
 KEEP_LOG = 300
+KEEP_COMMANDS = 20  # in control.json's "recent"
 IDLE, RUNNING, PAUSED = "idle", "running", "paused"
 # command -> (states it is allowed from, the state it leads to)
 COMMANDS = {
@@ -76,10 +79,16 @@ class Control:
             current = self.read()
             if current["state"] not in allowed:
                 raise ValueError("can't %s: the captain is %s" % (name, current["state"]))
+            seq = current.get("seq", 0) + 1
             control = {"state": new_state, "command": name, "unix": round(now, 3), "changed_at": _iso(now),
-                       "run_id": uuid.uuid4().hex[:8] if name == "start" else current.get("run_id"), "by": by}
+                       "run_id": uuid.uuid4().hex[:8] if name == "start" else current.get("run_id"), "by": by,
+                       "seq": seq}
             if note:
                 control["note"] = note
+            given = {k: control[k] for k in ("seq", "command", "by", "run_id", "unix")}
+            if note:
+                given["note"] = note
+            control["recent"] = (current.get("recent") or [])[-(KEEP_COMMANDS - 1):] + [given]
             _write(self.path, json.dumps(control))
             return control
 

@@ -181,6 +181,12 @@ def event(kind, **fields):
     tracer().event(kind, **fields)
 
 
+def process_started(**details):
+    """A "process-start" event: which code ran (APP_VERSION, the image tag deploy.sh sets) and
+    the settings that matter, so a trace shows restarts and what was running."""
+    event("process-start", version=os.environ.get("APP_VERSION") or "local", **details)
+
+
 def usage_of(response):
     """Token counts from an OpenAI Responses API response: {"in", "cached", "out"} or None."""
     usage = getattr(response, "usage", None)

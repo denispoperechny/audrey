@@ -17,11 +17,15 @@ back, and have a vision model answer a request about the picture.
        "arrived" (within its 4 m arrival radius). Not back within RETURN_TIMEOUT_S: error, with
        the model's answer in the message if there was one. No picture from the run by then: error.
 
+abort() (the stop tool calls it) ends a look at once, at any step: it sends no further command
+to the boat (so it can't undo the stop) and reports the error "aborted".
+
 So the boat never goes further than the turn plus RUN_S along the azimuth. Every way out (the
 answer, or any of the errors) waits for the boat to be back first. Its earlier destination is
 replaced: after this it holds still at `original` until it is sent on (start_navigation).
 """
 
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 
@@ -54,15 +58,41 @@ class VisualObserver:
         self.clock, self.sleep, self.poll_s = clock, sleep, poll_s
         self.align_timeout_s, self.run_s = align_timeout_s, run_s
         self.model_timeout_s, self.return_timeout_s = model_timeout_s, return_timeout_s
+        self._aborted = threading.Event()
+        self._send_lock = threading.Lock()  # a send and abort() never interleave
+
+    def abort(self):
+        """Ends a look in progress (the stop tool calls it before stopping the boat): once this
+        returns, the look sends nothing more to the boat."""
+        with self._send_lock:
+            self._aborted.set()
+
+    def _send(self, lat, lon):
+        with self._send_lock:
+            if self._aborted.is_set():
+                raise BoatError("aborted: stop() was called during the look; the boat is stopped where it is")
+            self.boat.send_destination(lat, lon)
+
+    def _check_aborted(self):
+        if self._aborted.is_set():
+            raise BoatError("aborted: stop() was called during the look; the boat is stopped where it is")
 
     def observe(self, original_lat, original_lon, azimuth_deg, request_note):
         if not (-90 <= original_lat <= 90 and -180 <= original_lon <= 180):
             raise BoatError("original_gps isn't a position: %r, %r" % (original_lat, original_lon))
-        original = (original_lat, original_lon)
-        azimuth_deg %= 360
+        self._aborted.clear()
+        try:
+            return self._observe((original_lat, original_lon), azimuth_deg % 360, request_note)
+        except BoatError as e:
+            if str(e).startswith("aborted"):
+                tracing.event("observe", phase="aborted")
+            raise
+
+    def _observe(self, original, azimuth_deg, request_note):
+        original_lat, original_lon = original
         lat, lon, _ = self.boat.position()
         started = self.clock()
-        self.boat.send_destination(*destination_point(lat, lon, azimuth_deg, OBSERVE_DISTANCE_M))
+        self._send(*destination_point(lat, lon, azimuth_deg, OBSERVE_DISTANCE_M))
         tracing.event("observe", phase="turning", azimuth_deg=azimuth_deg, request_note=request_note,
                       position={"lat": lat, "lon": lon}, original={"lat": original_lat, "lon": original_lon})
 
@@ -78,19 +108,22 @@ class VisualObserver:
         problem = []
         picture = self._poll_picture(aligned_at, run_end, problem)
         while picture is None and self.clock() < run_end:
+            self._check_aborted()
             self.sleep(self.poll_s)
             picture = self._poll_picture(aligned_at, run_end, problem)
 
         # Back to `original`; meanwhile the model looks at the picture, and if there isn't one
         # yet, the polling for one taken during the run goes on.
         back_sent = self.clock()
-        self.boat.send_destination(*original)
+        self._send(*original)
         tracing.event("observe", phase="going back", picture=picture.name if picture else None,
                       run_s=round(back_sent - aligned_at, 2))
-        with ThreadPoolExecutor(max_workers=1) as pool:
+        pool = ThreadPoolExecutor(max_workers=1)
+        try:
             asked = None if picture is None else self._ask(pool, picture, request_note, azimuth_deg)
             back_at = None
             while True:
+                self._check_aborted()
                 if picture is None:
                     picture = self._poll_picture(aligned_at, run_end, problem)
                     if picture is not None:
@@ -101,6 +134,8 @@ class VisualObserver:
                     break
                 self.sleep(self.poll_s)
             answer, model_error = self._answer(asked)
+        finally:
+            pool.shutdown(wait=False, cancel_futures=True)  # on an abort, don't wait for the model
         tracing.event("observe", phase="back" if back_at is not None else "not back",
                       back_in_s=round(back_at - back_sent, 2) if back_at is not None else None,
                       picture=picture.name if picture else None, picture_taken_at=picture.taken_at if picture else None,
@@ -154,8 +189,9 @@ class VisualObserver:
     def _bring_back(self, original):
         """Sends the boat to `original` and waits for it to arrive. Returns how it went, for a message."""
         sent = self.clock()
-        self.boat.send_destination(*original)
+        self._send(*original)
         while self._arrived_since(sent, original) is None:
+            self._check_aborted()
             if self.clock() - sent > self.return_timeout_s:
                 return "it was sent back to original_gps but hasn't arrived within %g s" % self.return_timeout_s
             self.sleep(self.poll_s)
@@ -179,4 +215,5 @@ class VisualObserver:
                     return message["unix"]
             if self.clock() - since > self.align_timeout_s:
                 return None
+            self._check_aborted()
             self.sleep(self.poll_s)

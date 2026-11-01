@@ -153,7 +153,7 @@ class Captain:
         self.last_wake_up = None
         self.paused_at = None
         self.note = None  # said once, at the next wake-up (e.g. "resumed after a pause")
-        self.seen_control = None
+        self.seen_seq = None  # the last command acted on (control.json's seq)
 
     def _log(self, entry, **trace):
         """To the captain's log (the UI) and, with `trace`'s extra fields, to the traces."""
@@ -181,6 +181,10 @@ class Captain:
             self._log({**entry, "error": "took over %g s: abandoned" % self.cycle_timeout_s, "took_s": round(time.time() - now, 1)},
                       message=message)
             raise
+        except asyncio.CancelledError:
+            self._log({**entry, "error": "interrupted by an operator command", "took_s": round(time.time() - now, 1)},
+                      message=message)
+            raise
         except Exception as e:
             self._log({**entry, "error": "%s: %s" % (type(e).__name__, e), "took_s": round(time.time() - now, 1)}, message=message)
             raise
@@ -205,37 +209,54 @@ class Captain:
         return result
 
     async def follow_control(self):
-        """Acts on a new command (from the UI, or the captain's own mission_complete). Returns
-        whether the captain should be waking up."""
+        """Acts on each new command (from the UI, or the captain's own mission_complete), in
+        order, even several given since the last check. Returns whether the captain should be
+        waking up."""
         if self.control is None:
             return True
         control = self.control.read()
-        key = (control.get("run_id"), control.get("command"), control.get("unix"))
-        if key != self.seen_control:
-            self.seen_control = key
-            command = control.get("command")
-            if command == "start":
-                self.run_id = control.get("run_id")
-                self.config = {"configurable": {"thread_id": "run-%s" % self.run_id}}
-                self.wake_ups, self.last_wake_up, self.paused_at, self.note = 0, None, None, None
-                if self.progress is not None:
-                    self.progress.clear()  # a new run: the previous one's notes don't apply
-                log.info("mission started (run %s)", self.run_id)
-                self._log({"kind": "command", "command": "start", "mission": read_mission(self.mission_file)})
-            elif command == "resume":
-                paused_for = time.time() - self.paused_at if self.paused_at else None
-                self.note = ("The mission was paused by the operator%s and is now resumed; the boat was stopped meanwhile."
-                             % (" for %.0f s" % paused_for if paused_for else ""))
-                self.paused_at = None
-                self._log({"kind": "command", "command": "resume"})
-            elif command in ("pause", "end", "cancel"):
-                self.paused_at = time.time() if command == "pause" else None
-                result = await self._stop_boat(command)
-                entry = {"kind": "command", "command": command, "boat_stop": result, "by": control.get("by", "operator")}
-                if control.get("note"):
-                    entry["note"] = control["note"]
-                self._log(entry)
+        recent = control.get("recent") or []
+        new = recent[-1:] if self.seen_seq is None else [c for c in recent if c.get("seq", 0) > self.seen_seq]
+        for given in new:  # just started (seen_seq None): only the latest one matters
+            self.seen_seq = given["seq"]
+            await self._act_on(given)
+        if self.seen_seq is None:
+            self.seen_seq = control.get("seq", 0)
         return control.get("state") == RUNNING
+
+    def interrupted(self):
+        """Whether a command given since the last check means a wake-up in progress should stop:
+        the operator's pause, end or cancel, or a new run. (The captain's own mission_complete
+        doesn't: that wake-up finishes, then the end is acted on.)"""
+        if self.control is None:
+            return False
+        control = self.control.read()
+        return control.get("seq", 0) != (self.seen_seq or 0) and control.get("by") != "captain" and (
+            control.get("state") != RUNNING or control.get("run_id") != self.run_id)
+
+    async def _act_on(self, given):
+        command = given.get("command")
+        if command == "start":
+            self.run_id = given.get("run_id")
+            self.config = {"configurable": {"thread_id": "run-%s" % self.run_id}}
+            self.wake_ups, self.last_wake_up, self.paused_at, self.note = 0, None, None, None
+            if self.progress is not None:
+                self.progress.clear()  # a new run: the previous one's notes don't apply
+            log.info("mission started (run %s)", self.run_id)
+            self._log({"kind": "command", "command": "start", "mission": read_mission(self.mission_file)})
+        elif command == "resume":
+            paused_for = time.time() - self.paused_at if self.paused_at else None
+            self.note = ("The mission was paused by the operator%s and is now resumed; the boat was stopped meanwhile."
+                         % (" for %.0f s" % paused_for if paused_for else ""))
+            self.paused_at = None
+            self._log({"kind": "command", "command": "resume"})
+        elif command in ("pause", "end", "cancel"):
+            self.paused_at = time.time() if command == "pause" else None
+            result = await self._stop_boat(command)
+            entry = {"kind": "command", "command": command, "boat_stop": result, "by": given.get("by", "operator")}
+            if given.get("note"):
+                entry["note"] = given["note"]
+            self._log(entry)
 
     async def run(self, stopping):
         next_at = time.monotonic()
@@ -252,14 +273,34 @@ class Captain:
                     next_at = time.monotonic()  # once started or resumed: wake up straight away
                 continue
             started = time.monotonic()
-            try:
-                await self.wake_up()
-            except asyncio.TimeoutError:
-                log.error("wake-up %d took over %g s: abandoned", self.wake_ups, self.cycle_timeout_s)
-            except Exception:
-                log.exception("wake-up %d failed", self.wake_ups)
+            if await self.watched_wake_up(stopping):
+                next_at = time.monotonic()  # interrupted: act on the command now
+                continue
             log.info("wake-up %d took %.1f s", self.wake_ups, time.monotonic() - started)
             next_at = time.monotonic() + self.sleep_s
+
+    async def watched_wake_up(self, stopping):
+        """One wake-up, while the control is checked every CONTROL_POLL_S: a pause, end or cancel
+        (or a new run) interrupts it at once, so the operator's command never waits for a long
+        wake-up (a visual_observe takes up to a minute). Returns whether it was interrupted."""
+        task = asyncio.create_task(self.wake_up())
+        while not task.done():
+            await asyncio.wait({task}, timeout=CONTROL_POLL_S)
+            if not task.done() and (self.interrupted() or stopping.is_set()):
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+                log.warning("wake-up %d interrupted by a command", self.wake_ups)
+                return True
+        try:
+            task.result()
+        except asyncio.TimeoutError:
+            log.error("wake-up %d took over %g s: abandoned", self.wake_ups, self.cycle_timeout_s)
+        except Exception:
+            log.exception("wake-up %d failed", self.wake_ups)
+        return False
 
 
 async def main_async():
@@ -284,6 +325,9 @@ async def main_async():
         return
     log.info("tools: %s; waking up %g s after each wake-up ends while a mission runs; mission from %s",
              ", ".join(t.name for t in tools), sleep_s, mission_file)
+    tracing.process_started(sleep_s=sleep_s, model=os.environ.get("FOUNDRY_MODEL") or captain_agent.DEFAULT_MODEL,
+                            history_tokens=[captain_agent.HISTORY_TRIGGER_TOKENS, captain_agent.HISTORY_KEEP_TOKENS],
+                            tools=[t.name for t in tools] + ["update_mission_progress", "mission_complete"])
     progress, control = MissionProgress(), Control()
     agent = captain_agent.build_agent(captain_agent.model(), list(tools) + [progress_tool(progress), mission_complete_tool(control)],
                                       sleep_s)

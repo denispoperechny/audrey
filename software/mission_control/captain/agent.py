@@ -99,6 +99,25 @@ async def boat_tools():
     return await client.get_tools()
 
 
+def traced_summarization_class():
+    """deepagents' summarization middleware, also tracing each summary it makes (the summary
+    stays inside deepagents' state, so it isn't in what the wake-ups return)."""
+    from deepagents.middleware.summarization import SummarizationMiddleware
+
+    import tracing
+
+    class TracedSummarization(SummarizationMiddleware):
+        @property
+        def name(self):  # the built-in's name, so it replaces it in place
+            return "SummarizationMiddleware"
+
+        def _build_new_messages_with_path(self, summary, file_path):
+            tracing.event("history-summary", summary=summary, evicted_to=file_path)
+            return super()._build_new_messages_with_path(summary, file_path)
+
+    return TracedSummarization
+
+
 def summary_prompt():
     from deepagents.middleware.summarization import DEEPAGENTS_DEFAULT_SUMMARY_PROMPT
 
@@ -112,15 +131,14 @@ def build_agent(chat_model, tools, sleep_s, home=HOME, history_trigger_tokens=HI
                 history_keep_tokens=HISTORY_KEEP_TOKENS):
     from deepagents import create_deep_agent
     from deepagents.backends import FilesystemBackend
-    from deepagents.middleware.summarization import SummarizationMiddleware
     from langgraph.checkpoint.memory import InMemorySaver
 
     from captain.geo_tools import TOOLS as GEO_TOOLS
 
     (Path(home) / "skills").mkdir(parents=True, exist_ok=True)
     backend = FilesystemBackend(root_dir=str(home), virtual_mode=True)
-    # Same name as deepagents' own summarization middleware, so it replaces it in place.
-    history = SummarizationMiddleware(chat_model, backend=backend, trigger=("tokens", history_trigger_tokens),
+    TracedSummarization = traced_summarization_class()
+    history = TracedSummarization(chat_model, backend=backend, trigger=("tokens", history_trigger_tokens),
                                       keep=("tokens", history_keep_tokens), summary_prompt=summary_prompt())
     return create_deep_agent(
         model=chat_model,

@@ -154,8 +154,16 @@ async def navigate_to(lat: float, lon: float) -> NavigationStarted:
 @mcp.tool(name="stop", structured_output=True)
 async def stop() -> Stopped:
     """Makes the boat forget its destination, so it stops driving and holds neutral; waits a few
-    seconds for its telemetry to confirm."""
-    return Stopped(**await in_thread("stop", {}, boat().stop))
+    seconds for its telemetry to confirm. Also ends a visual_observe in progress at once (it
+    reports "aborted")."""
+    return Stopped(**await in_thread("stop", {}, stop_now))
+
+
+def stop_now():
+    """A look in progress first (so it can't send the boat anywhere after the stop), then the boat."""
+    if _observer is not None:
+        _observer.abort()
+    return boat().stop()
 
 
 @mcp.tool(name="visual_observe", structured_output=True)
@@ -201,6 +209,10 @@ def app():
 def main():
     import uvicorn
 
+    from boat_mcp.observe import ALIGN_TIMEOUT_S, ALIGN_TOLERANCE_DEG, RUN_S
+
+    tracing.process_started(max_distance_m=MAX_DISTANCE_M, observe={"align_tolerance_deg": ALIGN_TOLERANCE_DEG,
+                                                                    "align_timeout_s": ALIGN_TIMEOUT_S, "run_s": RUN_S})
     uvicorn.run(app(), host="0.0.0.0", port=int(os.environ.get("BOAT_MCP_PORT") or DEFAULT_PORT))
 
 
